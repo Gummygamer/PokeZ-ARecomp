@@ -293,6 +293,43 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4(clamp(vec3(y + 1.402 * c.y, y - 0.344136 * c.x - 0.714136 * c.y, y + 1.772 * c.x), 0.0, 1.0), 1.0);\n"
                "}\n";
     }
+    // ---- PCVR, first person (exec.c vk_xr_eye): one eye's picture from the game's, which was drawn once from between
+    // the eyes. Each pixel of the eye is a ray from the eye (eye.xyz, in the head's space, metres; the tangents of its
+    // field of view fov: left, right, up, down); the point it hits is found in the game's depth (dep: reversed,
+    // near / distance - zeps; cen = the game camera's half field of view as tangents, near, zeps) by stepping the ray to
+    // the depth seen at the place its point shows in the game's picture, a few times over - the eyes are 3 cm from
+    // that camera, so it settles at once except at the edge of something near, where what was hidden behind it is
+    // filled from next to it. The colour is the game's there (crop: its part of the texture, flags.x: upside down;
+    // flags.y: the target is an sRGB image - the game's bytes are sRGB already). dsz: the depth's picture in texels.
+    // No depth (flags.z = 0): the game's picture as it is, for both eyes.
+    if (!strcmp(name, "vr_eye.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D col;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D dep;\n"
+               "layout(push_constant) uniform P { vec4 fov; vec4 eye; vec4 cen; vec4 crop; vec4 dsz; vec4 flags; vec4 vp; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 lin(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }\n"
+               "void main() {\n"
+               "  vec2 n = (gl_FragCoord.xy - pc.vp.xy) / pc.vp.zw;\n"
+               "  vec3 dir = vec3(mix(pc.fov.x, pc.fov.y, n.x), mix(pc.fov.z, pc.fov.w, n.y), -1.0);\n"
+               "  float t = 1000.0;\n"
+               "  vec2 uv = vec2(0.5);\n"
+               "  for (int i = 0; i < 6; i++) {\n"
+               "    vec3 p = pc.eye.xyz + dir * t;\n"
+               "    float z = max(-p.z, 0.01);\n"
+               "    uv = vec2(p.x / (z * pc.cen.x) * 0.5 + 0.5, 0.5 - p.y / (z * pc.cen.y) * 0.5);\n"
+               "    if (pc.flags.z < 0.5) break;\n"
+               "    ivec2 q = clamp(ivec2(uv * pc.dsz.xy), ivec2(0), ivec2(pc.dsz.xy) - 1);\n"
+               "    float d = texelFetch(dep, q, 0).r;\n"
+               "    t = clamp(pc.cen.z / max(d + pc.cen.w, 1e-6), 0.02, 5000.0) + pc.eye.z;\n"
+               "  }\n"
+               "  uv = clamp(uv, vec2(0.0), vec2(1.0));\n"
+               "  if (pc.flags.x > 0.5) uv.y = 1.0 - uv.y;\n"
+               "  vec3 c = textureLod(col, pc.crop.xy + uv * pc.crop.zw, 0.0).rgb;\n"
+               "  o = vec4(pc.flags.y > 0.5 ? lin(c) : c, 1.0);\n"
+               "}\n";
+    }
     if (!strcmp(name, "texcopy.frag")) {  // (texture dumps: alpha kept - foliage, fences, decals are cut out by it)
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

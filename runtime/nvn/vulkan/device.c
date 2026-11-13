@@ -17,6 +17,8 @@
 #include "vk.h"
 #include "record.h"
 #include "vk_dlaa.h"
+#include "../../vr.h"
+#include "xr.h"
 #include "../output_scale.h"
 #include "../renderer.h"
 #include "../pace.h"
@@ -159,9 +161,10 @@ static bool validating;  // the validation layer is on (validation_exit)
 static void create_instance(void) {
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
-    const char *ext[20];
+    const char *ext[40];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+    n_ext = xr_instance_extensions(ext, n_ext, 34);  // (PCVR: what the OpenXR runtime needs of the instance, xr.c)
     bool strict = getenv("LARECOMP_VK_VALIDATION_STOP") != NULL;
     const char *gpuav = getenv("LARECOMP_VK_GPUAV");
     bool validate = strict || getenv("LARECOMP_VK_VALIDATION") != NULL || gpuav;
@@ -255,6 +258,7 @@ static void pick_device(void) {
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
     vkEnumeratePhysicalDevices(g_vk.inst, &n, pd);
     int want = ENV("LARECOMP_GPU") ? atoi(ENV("LARECOMP_GPU")) : -1, best = -1, best_score = -1;
+    VkPhysicalDevice xr_gpu = xr_physical_device();
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
@@ -265,6 +269,7 @@ static void pick_device(void) {
         int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 6 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 4 : 2;
         if (p.apiVersion >= VK_API_VERSION_1_3) score++;
         if (g_settings.gpu_name[0] && !strcmp(p.deviceName, g_settings.gpu_name)) score = 50;
+        if (pd[i] == xr_gpu) score = 50;  // (PCVR: the GPU the headset is on - its session can't be made on another)
         if ((int)i == want) score = 100;
         if (score > best_score) { best_score = score; best = (int)i; }
     }
@@ -745,7 +750,7 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[40];
+    const char *ext[64];
     uint32_t n_ext = 0;
     // Vulkan 1.2: the 1.3 features the driver has as extensions. LARECOMP_VK_COMPAT=1 takes none of them (the compat.c
     // ways), =<names> only leaves out those: rendering, sync, eds, eds2 (e.g. =sync)
@@ -790,6 +795,7 @@ static void create_device(void) {
     if (x_ds) ext[n_ext++] = VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME;
     if (x_ds2) ext[n_ext++] = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    n_ext = xr_device_extensions(ext, n_ext, 40);  // (PCVR: what the OpenXR runtime needs of the device, xr.c)
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
     g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
@@ -1317,7 +1323,8 @@ static VkPresentModeKHR present_mode(void) {
     // apart, and while they cross, frames are dropped and shown twice for a few seconds at a steady 60 fps (judder
     // running through the city); FIFO shows every frame on its own refresh.
     const char *e = ENV("LARECOMP_VK_PRESENT");
-    VkPresentModeKHR want = !e ? (g_settings.present_fifo ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_MAILBOX_KHR)
+    // PCVR: the headset paces the frames (xr.c xrWaitFrame); FIFO would add the monitor's wait to each of them
+    VkPresentModeKHR want = !e ? (g_settings.present_fifo && !xr_on() ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_MAILBOX_KHR)
                           : !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     uint32_t n = 0;
@@ -1974,7 +1981,60 @@ void vk_frame_end(const char *shot_path) {
     VkCommandBuffer cb = vk_cmd();
     rec_CmdEndRendering(cb);
     VkSpan shot = {0};
-    if (shot_path) save_window_image(cb, &shot);
+    bool xr_frame = false;
+    {   // PCVR (xr.c): the window's picture, the overlay with it, onto the headset's screen. The bytes as they are: the
+        // headset's image is the sRGB format of the window's (blit: no such format there - converted, too bright)
+        bool blit = false;
+        VkImage xi = VK_NULL_HANDLE, s = g_vk.sc_images[cur_frame.image];
+        XrEyes eyes;
+        extern bool vk_xr_eye(VkCommandBuffer cb, VkImageView dst, VkFormat fmt, bool srgb, int32_t x, int32_t y, uint32_t w, uint32_t h,
+                              const float fov[4], const float eye[3], const VrRenderView *rv);
+        int xm = xr_frame_begin(g_vk.sc_format, g_vk.sc_extent, &xi, &blit, &eyes);
+        if (xm == 2) {  // first person: each eye's picture from the game's and its depth (exec.c vk_xr_eye)
+            for (int e = 0; e < 2; e++) {
+                image_barrier(cb, eyes.image[e], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                vk_xr_eye(cb, eyes.view[e], eyes.format, true, 0, 0, eyes.w, eyes.h, eyes.fov[e], eyes.eye[e], &eyes.rv);
+            }
+            xr_frame = true;
+        } else if (xm == 0 && ENV("LARECOMP_VR_SBS")) {
+            // (test, no headset) LARECOMP_VR_SBS=<eye distance, mm>: both eyes' pictures side by side over the window's,
+            // as vk_xr_eye makes them for a headset 100 degrees wide - what the stereo does, seen in a window shot
+            VrRenderView rv;
+            static int nlog2;
+            extern bool vk_scene_view(float out[16]);
+            float sv[16];
+            bool have = vk_scene_view(sv) && vr_render_view_of(sv, &rv);
+            if (!have && nlog2++ < 4) LOG("[vr] side by side: no first-person camera yet\n");
+            if (have) {
+                float ipd = (float)atof(ENV("LARECOMP_VR_SBS")) * 0.001f, t = 1.19f, tv = 1.0f;
+                uint32_t hw = g_vk.sc_extent.width / 2, hh = g_vk.sc_extent.height;
+                for (int e = 0; e < 2; e++) {
+                    float fov[4] = {-t, t, tv, -tv}, eye[3] = {e ? ipd / 2 : -ipd / 2, 0, 0};
+                    bool ok = vk_xr_eye(cb, g_vk.sc_views[cur_frame.image], g_vk.sc_format, false, e ? (int32_t)hw : 0, 0, hw, hh, fov, eye, &rv);
+                    static int nlog;
+                    if (nlog++ < 4) LOG("[vr] side by side: eye %d %s\n", e, ok ? "drawn" : "no game picture this frame");
+                }
+            }
+        }
+        if (xm == 1 && xi) {
+            int32_t w = (int32_t)g_vk.sc_extent.width, h = (int32_t)g_vk.sc_extent.height;
+            image_barrier(cb, s, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            image_barrier(cb, xi, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            if (blit) {
+                VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {w, h, 1}},
+                                  .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {w, h, 1}}};
+                rec_CmdBlitImage(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, xi, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+            } else {
+                VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                 .extent = {g_vk.sc_extent.width, g_vk.sc_extent.height, 1}};
+                rec_CmdCopyImage(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, xi, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            }
+            image_barrier(cb, xi, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            image_barrier(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            xr_frame = true;
+        }
+    }
+    if (shot_path) save_window_image(cb, &shot);  // (after the headset's part: LARECOMP_VR_SBS draws on the window)
     if (g_vk.hdr) {  // the SDR image drawn -> the window's HDR image
         extern void vk_hdr_encode(VkCommandBuffer cb, VkImageView sdr, VkImageView base, VkImageView dst);
         VkImage hi = g_vk.hdr_images[cur_frame.image];
@@ -2002,6 +2062,7 @@ void vk_frame_end(const char *shot_path) {
     if (!done_sem[img]) done_sem[img] = binary_semaphore();
     uint64_t seq = vk_pending_seq();
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
+    if (xr_frame) xr_frame_end();  // (the headset's frame ends behind the submission that drew its picture)
     // the present follows the submission in the recorder's order (its wait for the display is the recorder's, counted in
     // g_vk_frame_waits[2]; an out-of-date result makes the next vk_frame_begin recreate the swapchain). The present
     // watch runs there too, after it (vk_present_watch); what it finds is acted on here.
@@ -2289,7 +2350,16 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         // interiors / dungeons: their 16:9 centre, or the part inside a room wider than one screen
         extern void widescreen_present_crop(uint64_t, double, float *, double *, double *, double *, double *);
         float crop[4];  // uv origin and size
-        widescreen_present_crop(frame, shape, crop, &vx, &vy, &vw, &vh);
+        double vr_shape, vr_lines;
+        if (vr_render_shape(&vr_shape, &vr_lines)) {
+            // The VR camera already draws the headset's full field of view.
+            // Legacy 16:9 boxing crops tall outputs (e.g. y=.2, height=.6),
+            // invalidating the projection submitted to OpenXR.
+            crop[0] = crop[1] = 0;
+            crop[2] = crop[3] = 1;
+        } else {
+            widescreen_present_crop(frame, shape, crop, &vx, &vy, &vw, &vh);
+        }
         {   // the game's own crop of its window texture (handheld: 1280x720 of a 1920x1080 texture): only that part is the picture
             extern int g_present_crop[4], g_present_tex[2];
             const int *wc = g_present_crop, tw = g_present_tex[0], th = g_present_tex[1];
@@ -2611,6 +2681,7 @@ void ui_window_init(void) {
     }
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !ENV("LARECOMP_WINDOW") && !ENV("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
+    xr_startup();  // (PCVR, when asked for: before the instance - its runtime names the Vulkan extensions it needs)
     create_instance();
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
     // A chosen Graphics card that fails to start (a FATAL, a driver crash) would fail every start, the start screen's
@@ -2625,6 +2696,7 @@ void ui_window_init(void) {
     vk_exec_init();
     vk_shaders_init();
     if (chosen[0] || dx12_chosen) settings_save();
+    xr_session_start();
 }
 
 SDL_Window *ui_window(void) { return window; }

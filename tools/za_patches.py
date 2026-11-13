@@ -92,6 +92,43 @@ def _za_smooth_anim(gen, a):
             f'  /* {a:#x}: ldrb w8, [x8, #0x1f4] (the entity updates every frame: distant ones too) */')
 
 
+# The thrown ball (PCVR, runtime/hle/vr_input.c rt_za_ball_velocity): the action node "SetBallVelocity" (parameters
+# LinearVelocity, AngularVelocity, LerpRate, XZOnly; its run function is f_70028c773c in 2.0.0) reads the ball body's
+# velocities, moves them towards its parameters by LerpRate and sets them (bl f_7001198404: x0 the body, x1 / x2 the
+# linear and angular velocity, a vec4 each at sp + 0x20 and sp). The address is that function's last store before the
+# call (str q1, [sp]): the host sees the body and both vectors there and may write another velocity - the hand's.
+# Builds not listed: no hook (the ball flies as the game throws it).
+ZA_BALL = {'8a1c86c437394b69': 0x70028c791c}  # 2.0.0
+
+
+def _za_ball_velocity(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x3d8003e1, hex(w)  # str q1, [sp]
+    return ('{ extern void rt_za_ball_velocity(uint64_t, uint64_t, uint64_t); uint64_t ea = c->sp + 0x0ull; '
+            'ST128(ea, c->v[1]); rt_za_ball_velocity(c->x[0], c->sp + 0x20ull, c->sp); }'
+            f'  /* {a:#x}: str q1, [sp] (SetBallVelocity, before the body gets its velocities) */')
+
+
+# The camera (PCVR, runtime/hle/vr_camera.c rt_za_camera): the renderer's "set this camera's parameters" call
+# (f_7001818c00 in 2.0.0: x0 the camera manager, x1 the camera's handle, x2 its parameters: 0x40 bytes of lens
+# settings, position at +0x40, column-major view at +0x50, projection at +0x90, 0xd0 in all. It copies these into
+# the manager's slot for that camera; the field
+# camera's component calls it from f_70018d7aa0 with its own block, component + 0x180, once the camera has moved). The
+# address is that function's first instruction: the host sees the parameters before they are copied and may write
+# others. The runtime hook currently validates/logs the layout; it does not yet replace the camera with a headset
+# view. Found from the scene's camera constants backwards (the lighting pass's
+# block is a copy of the slot: LARECOMP_CAM_WATCH, runtime/nvn/vulkan/exec.c). Builds not listed: no hook.
+ZA_CAMERA = {'8a1c86c437394b69': 0x7001818c00}  # 2.0.0
+
+
+def _za_camera(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0xa9bb7bfd, hex(w)  # stp x29, x30, [sp, #-0x50]!
+    return ('{ extern void rt_za_camera(uint64_t, uint64_t, uint64_t); rt_za_camera(c->x[0], c->x[1], c->x[2]); '
+            'uint64_t ea = c->sp - 80; ST64(ea, c->x[29]); ST64(ea + 8, c->x[30]); c->sp = ea; }'
+            f'  /* {a:#x}: stp x29, x30, [sp, #-0x50]! (camera parameters, before they are stored) */')
+
+
 def za_patches(build):
     out = {ZA_BUILDS[build]: _za_frame_cfg}
     if build in FRAME_DT:
@@ -103,4 +140,8 @@ def za_patches(build):
         out[a] = lambda gen, a, target=target: _za_oodle_call(gen, a, target)
     if build in SMOOTH_ANIM:
         out[SMOOTH_ANIM[build]] = _za_smooth_anim
+    if build in ZA_BALL:
+        out[ZA_BALL[build]] = _za_ball_velocity
+    if build in ZA_CAMERA:
+        out[ZA_CAMERA[build]] = _za_camera
     return out

@@ -18,6 +18,7 @@
 #include "../rumble.h"
 #include "../led.h"
 #include "../ui/menu.h"
+#include "../vr.h"
 
 enum {
     BTN_A = 0, BTN_B, BTN_X, BTN_Y, BTN_LSTICK, BTN_RSTICK, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
@@ -83,8 +84,10 @@ void input_rumble_poll(void) {
     // Renew SDL's 250 ms effect every 100 ms while frames are progressing.
     // A stalled render/UI thread therefore cannot leave an infinite effect.
     // This watchdog is a host policy, not a duration supplied by the game.
-    bool suppress = (now > last_frame && now - last_frame > 250) || !pad || host_test || !g_settings.rumble || menu_is_open() ||
-                    !SDL_GetKeyboardFocus();
+    // (PCVR: the headset's controllers vibrate too, with no pad and with the headset holding the focus - vr_input.c)
+    bool vr = vr_active();
+    bool suppress = (now > last_frame && now - last_frame > 250) || (!pad && !vr) || host_test || !g_settings.rumble || menu_is_open() ||
+                    (!SDL_GetKeyboardFocus() && !vr);
     SDL_LockSpinlock(&rumble_lock);
     if (suppress) memset(rumble_values, 0, sizeof rumble_values);
     else if (rumble_allowed) {
@@ -93,6 +96,7 @@ void input_rumble_poll(void) {
         if (pct > 0 && pct < 100) lo = (uint16_t)(lo * pct / 100), hi = (uint16_t)(hi * pct / 100);
     }
     SDL_UnlockSpinlock(&rumble_lock);
+    if (vr || rumble_last_lo || rumble_last_hi) vr_rumble(lo, hi);
     if (pad && (lo != rumble_last_lo || hi != rumble_last_hi ||
                 ((lo || hi) && now - rumble_last_ms >= 100))) {
         if (!SDL_RumbleGamepad(pad, lo, hi, (lo || hi) ? 250 : 0) && !rumble_warned) {
@@ -1079,7 +1083,8 @@ static void fill_state(Cpu *c) {
         LOG("[input] watching controller object %llx\n", c->x[1] - 8);
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
-    uint64_t held = key_buttons | pad_buttons | mouse_buttons;
+    int32_t vst[4] = {0};  // (PCVR: the headset's controllers, runtime/hle/vr_input.c)
+    uint64_t held = key_buttons | pad_buttons | mouse_buttons | vr_pad_state(vst);
     atomic_fetch_and(&press_unseen, ~held);  // (the game sees these now)
     static uint64_t tap, tap_frame;  // (pressed and released since the last poll: held for the rest of this frame)
     {
@@ -1097,10 +1102,10 @@ static void fill_state(Cpu *c) {
         if (g_inject_plus > 0) { until = renderer_present_count() + 10; g_inject_plus = 0; }
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
-    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
+    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx + vst[0]) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly + vst[1]) + script_ly);
     int32_t mrx, mry;
     mouse_stick(&mrx, &mry);
-    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mrx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + mry) + script_ry);
+    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mrx + vst[2]) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + mry + vst[3]) + script_ry);
     {
         extern uint64_t renderer_present_count(void);
         record_input(renderer_present_count(), b, (int32_t[4]){lx, ly, rx, ry});  // (before mirror mode swaps them)

@@ -430,6 +430,7 @@ void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
 // function (f_<guest addr>) doing them, then the page is reopened until the next re-arm.
 uint64_t g_watch_lo, g_watch_hi;
 uint64_t g_fault_lr;  // (the platform's handler: the faulting thread's link register, for the watch log)
+uint64_t g_fault_chain[6];  // (Windows: return addresses inside game functions found on the faulting thread's stack)
 int g_watch_write;  // (set by the platform's fault handler: 1 = a write)
 static uint64_t watch_page;
 static void *watch_thread(void *a) {
@@ -469,12 +470,14 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
         extern uint64_t renderer_present_count(void);
         static uint64_t last_frame, last_pc;
         uint64_t fr = renderer_present_count();
-        if (getenv("LARECOMP_WATCH_ADDR") && (fr != last_frame || pc != last_pc) && hits++ < 4000) {
+        if ((getenv("LARECOMP_WATCH_ADDR") || getenv("LARECOMP_CAM_WATCH")) && (fr != last_frame || pc != last_pc) && hits++ < 400) {
             last_frame = fr, last_pc = pc;
             uint64_t lo = 0;
             const char *ls = host_sym(lr, &lo);
-            fprintf(stderr, "[watch] frame %llu +%#llx pc %s lr %s+%llx\n", (unsigned long long)fr,
+            fprintf(stderr, "[watch] frame %llu %c +%#llx pc %s lr %s+%llx", (unsigned long long)fr, g_watch_write ? 'w' : 'r',
                     (unsigned long long)(fa - g_watch_lo), host_sym(pc, NULL) ? host_sym(pc, NULL) : "?", ls ? ls : "?", (unsigned long long)lo);
+            for (int i = 1; i < 6 && g_fault_chain[i]; i++) fprintf(stderr, " < %s", host_sym(g_fault_chain[i], NULL));
+            fprintf(stderr, "\n");
         }
         static char seen[64][48];
         static int nseen;

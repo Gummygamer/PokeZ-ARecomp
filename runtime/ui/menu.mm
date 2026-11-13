@@ -703,6 +703,16 @@ static void tab_display(bool in_game) {
                           "demora para mostrar a janela (gravação de tela, área de trabalho ocupada).")))
             g_settings.present_fifo = fp == 1;
     }
+    // PCVR (runtime/vr.h, vulkan/xr.c): the OpenXR session is made with the GPU device, so from the next start
+    opt_toggle(TR("VR headset", "Headset de RV"), &g_settings.vr, false,
+               TR("Play in a PC VR headset (OpenXR: Quest Link / Air Link, SteamVR...), from the next start: the picture "
+                  "on a screen in front of you, the headset's controllers as the gamepad, and Poké Balls thrown with a "
+                  "swing of the hand while the right trigger is held. Connect the headset before starting. The window "
+                  "must stay open (not minimised).",
+                  "Jogue em um headset de RV de PC (OpenXR: Quest Link / Air Link, SteamVR...), a partir do próximo "
+                  "início: a imagem em uma tela à sua frente, os controles do headset como o gamepad, e Poké Bolas "
+                  "lançadas com um movimento da mão enquanto o gatilho direito está apertado. Conecte o headset antes "
+                  "de iniciar. A janela precisa ficar aberta (não minimizada)."));
 #endif
     {   // Pokémon Z-A's dynamic resolution (runtime/nvn/vulkan/exec.c vk_counter_mode)
         extern bool g_za_frame_hook;

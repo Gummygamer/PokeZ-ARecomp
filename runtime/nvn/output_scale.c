@@ -448,7 +448,12 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     static double forced = -1, wide_test = -1;
     if (forced < 0) forced = getenv("LARECOMP_SCALE") ? atof(getenv("LARECOMP_SCALE")) : 0;
     if (wide_test < 0) wide_test = getenv("LARECOMP_WIDE_TEST") ? atof(getenv("LARECOMP_WIDE_TEST")) : 0;
-    double shape = wide_test > 0 ? wide_test : (dw / dh) / (16.0 / 9.0);
+    // PCVR, first person (hle/vr_camera.c): the headset's shape and its own height, whatever the window's
+    extern bool vr_render_shape(double *shape, double *lines);
+    double vr_shape = 0, vr_lines = 0;
+    bool vr_fp = wide_test <= 0 && vr_render_shape(&vr_shape, &vr_lines);
+    if (vr_fp) reshape_allowed = true;
+    double shape = wide_test > 0 ? wide_test : vr_fp ? vr_shape : (dw / dh) / (16.0 / 9.0);
     bool reshape = reshape_allowed && fabs(shape - 1.0) > 0.005;
     if (!reshape) shape = 1.0;
     // render height in units of the Switch's 1080 lines
@@ -466,6 +471,7 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     }
     p_mode = mode, p_ups = g_settings.upscaler, p_aa = g_settings.antialias;
     if (forced > 0) h = forced;
+    else if (vr_fp) h = vr_lines;
     else if (mode >= 1 && mode <= 8) h = mode == 1 && g_gpu_integrated ? 720 / 1080.0 : mode;
     else if (mode == RES_X15) h = 1.5;  // (between 1x and 2x: most of 2x's smoothing for about half its cost)
     else {

@@ -315,6 +315,7 @@ void settings_load(void) {
         else if (!strcmp(key, "smooth_anim")) g_settings.smooth_anim = atoi(val) != 0;
         else if (!strcmp(key, "full_detail_models")) g_settings.full_detail = atoi(val) != 0;
         else if (!strcmp(key, "draw_distance")) g_settings.draw_dist = atoi(val);
+        else if (!strcmp(key, "vr")) g_settings.vr = atoi(val) != 0;
         else if (!strcmp(key, "hdr")) g_settings.hdr = atoi(val) != 0;
         else if (!strcmp(key, "hdr_peak_nits")) { int n = atoi(val); g_settings.hdr_peak = n < 200 ? 200 : n > 10000 ? 10000 : n; }
         else if (!strcmp(key, "hdr_paper_white_nits")) { int n = atoi(val); g_settings.hdr_paper = n < 80 ? 80 : n > 500 ? 500 : n; }
@@ -466,6 +467,7 @@ void settings_save(void) {
     fprintf(f, "smooth_anim = %d\n", g_settings.smooth_anim);
     fprintf(f, "full_detail_models = %d\n", g_settings.full_detail);
     fprintf(f, "draw_distance = %d\n", g_settings.draw_dist);
+    fprintf(f, "vr = %d\n", g_settings.vr);
     fprintf(f, "aniso16 = %d\n", g_settings.aniso16);
     fprintf(f, "hdr = %d\n", g_settings.hdr);
     fprintf(f, "hdr_peak_nits = %d\n", g_settings.hdr_peak);

@@ -46,6 +46,9 @@ typedef struct {
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint16_t vr_cut;        // (GLSL vertex) PCVR, first person: the player character's own head is clipped away - what
+                            // is within the low byte's cm of a point the high byte's cm behind the camera (0: nothing.
+                            // In the padding after glsl: keys without it hash as before - shader caches stay valid.)
     uint32_t stencil_slots; // (GLSL) texture handle slots ((handle_offset - 0x20) / 8) bound in stencil mode
                             // (NVN depth/stencil mode STENCIL) or with an unsigned integer format: a usampler,
                             // results read as uint bits (what Maxwell's texture fetches give for those)

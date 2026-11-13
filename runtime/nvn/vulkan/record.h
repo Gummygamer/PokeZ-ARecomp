@@ -32,6 +32,10 @@ void rec_QueueSubmit2(const VkSubmitInfo2 *si, uint64_t seq);
 // swapchain synchronised with the presents (device.c).
 void rec_QueuePresentKHR(VkSemaphore wait, VkSwapchainKHR swapchain, uint32_t image, uint64_t present_id);
 bool rec_present_recreate(void);  // (and clears it) the last present asked for a new swapchain (OUT_OF_DATE / SUBOPTIMAL)
+// fn(arg) on the thread that makes the driver's calls, in its place among them (at once with the recorder off): what
+// else needs the queue to itself after a submission - the headset's frame end (xr.c: OpenXR uses the queue there).
+// Dropped like every packet once quitting (rec_quit).
+void rec_call(void (*fn)(void *), void *arg);
 
 // ---- descriptor sets (the translating thread only)
 // A set of layout from slot's pools: the real set with the recorder off; a stand-in otherwise, which the recorder

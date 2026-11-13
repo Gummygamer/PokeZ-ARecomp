@@ -3003,6 +3003,18 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             }
     }
     if (stage == STAGE_VERTEX) {
+        // PCVR, first person (ShaderKey.vr_cut; hle/vr_camera.c vr_head_cut): the camera is inside the player
+        // character's head, and where the head moves in its animation it came into view. A clip distance: what is
+        // within the cut's radius (the low byte, cm) of the head's middle - which the camera keeps the high byte's cm
+        // behind itself, along the way it looks - is cut away, smoothly through a triangle, not vertex by vertex.
+        // Around the head and not around the eyes: a ball around the eyes took the collar and the chest with it, and
+        // looking down showed a hollow body. The place is found from the clip position alone (w is the depth ahead; x
+        // and y across and up, divided by the tangents of half the first-person field of view: 1.2 and 1.1 for every
+        // headset - a few percent off only makes the cut-out a little oval), so no shader needs a constant of its own.
+        // A camera the head is not within reach of draws it whole: a mirror's, a shadow map's (w = 1 there: 1 m away).
+        if (key && key->vr_cut && c->glsl && !xfb)
+            sp(&s, "  gl_ClipDistance[0] = length(vec3(gl_Position.x * 1.2f, gl_Position.y * 1.1f, gl_Position.w + %.2ff)) - %.2ff;\n",
+               (key->vr_cut >> 8) * 0.01, (key->vr_cut & 0xFF) * 0.01);
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
         if (key && key->flip_x) sp(&s, "  gl_Position.x = -gl_Position.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\n");

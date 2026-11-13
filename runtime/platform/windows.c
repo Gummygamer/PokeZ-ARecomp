@@ -1,5 +1,6 @@
 // Windows host layer (runtime/platform.h).
 #include <windows.h>
+#include <tlhelp32.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -42,6 +43,12 @@ static bool lazy_commit(uint64_t a) {
     // commit is a no-op (the race below: the access is retried). Only a page protected on purpose (LARECOMP_WATCH)
     // must stay as it is - a commit makes it read-write again.
     extern uint64_t g_watch_lo;
+    // (the watched page itself is committed and protected on purpose: straight to the watch. Anything else commits as
+    // without a watch - a VirtualQuery per fault stopped the game dead when the watched page was a busy heap page; a
+    // commit that reopens the watched page is undone by the watch thread within 100 us)
+    extern uint64_t g_watch_hi;
+    if (g_watch_lo && g_watch_hi && (a & ~0x3FFFull) == (g_watch_lo & ~0x3FFFull)) return false;
+    if (g_watch_lo && g_watch_hi) return VirtualAlloc((void *)(uintptr_t)(a & ~(COMMIT_CHUNK - 1)), COMMIT_CHUNK, MEM_COMMIT, PAGE_READWRITE) != NULL;
     if (!g_watch_lo) return VirtualAlloc((void *)(uintptr_t)(a & ~(COMMIT_CHUNK - 1)), COMMIT_CHUNK, MEM_COMMIT, PAGE_READWRITE) != NULL;
     MEMORY_BASIC_INFORMATION mi;
     if (!VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi)) return false;
@@ -56,14 +63,102 @@ static bool lazy_commit(uint64_t a) {
 
 static bool g_report_crashes;
 
+// (debug, LARECOMP_CAM_WATCH) hardware write breakpoints on up to 4 guest addresses (8 bytes each), set in every
+// thread alive now: the handler below logs who wrote - the instruction's function and the game functions found on the
+// stack ("[hw] w<slot> ..."), each (slot, function) 3 times. Unlike a protected page (LARECOMP_WATCH_ADDR) nothing
+// else on the page is disturbed - a busy heap page under PAGE_NOACCESS froze the game.
+static uint64_t g_hw_addr[4];
+void plat_hw_watch(const uint64_t *addr, int n) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    for (int i = 0; i < 4; i++) g_hw_addr[i] = i < n ? addr[i] : 0;
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
+    int nt = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        if (SuspendThread(t) != (DWORD)-1) {
+            CONTEXT c = {.ContextFlags = CONTEXT_DEBUG_REGISTERS};
+            if (GetThreadContext(t, &c)) {
+                c.Dr0 = g_hw_addr[0], c.Dr1 = g_hw_addr[1], c.Dr2 = g_hw_addr[2], c.Dr3 = g_hw_addr[3];
+                c.Dr7 = 0;
+                for (int i = 0; i < n && i < 4; i++) c.Dr7 |= (1ull << (i * 2)) | (0x9ull << (16 + i * 4));  // (write, 8 bytes)
+                c.Dr6 = 0;
+                nt += SetThreadContext(t, &c) != 0;
+            }
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    fprintf(stderr, "[hw] %d write breakpoints set in %d threads\n", n, nt);
+}
+static bool hw_hit(EXCEPTION_POINTERS *ep) {
+    uint64_t d6 = ep->ContextRecord->Dr6 & 0xF;
+    if (!d6 || !g_hw_addr[0]) return false;
+    extern const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);
+    static struct { uint64_t fn; int slot, n; } seen[256];
+    static int nseen;
+    static volatile LONG lock;
+    uint64_t pc = ep->ContextRecord->Rip, off = 0;
+    const char *nm0 = rt_host_fn_name(pc, &off);  // (its buffer is the next call's too: copied)
+    char nmbuf[40];
+    if (nm0) snprintf(nmbuf, sizeof nmbuf, "%s", nm0);
+    const char *nm = nm0 ? nmbuf : NULL;
+    const uint64_t *sp = (const uint64_t *)(uintptr_t)ep->ContextRecord->Rsp;
+    uint64_t chain[8];
+    int nc = 0;
+    for (int i = 0; i < 600 && nc < 8; i++)
+        if (sp[i] > 0x10000 && rt_host_fn_name(sp[i], NULL)) chain[nc++] = sp[i];
+    uint64_t key = nm ? pc - off : nc ? chain[0] : pc;
+    for (int slot = 0; slot < 4; slot++) {
+        if (!(d6 >> slot & 1)) continue;
+        while (InterlockedExchange(&lock, 1)) Sleep(0);
+        int k = 0;
+        while (k < nseen && !(seen[k].fn == key && seen[k].slot == slot)) k++;
+        bool log = false;
+        if (k < nseen) log = seen[k].n++ < 3;
+        else if (nseen < 256) seen[nseen].fn = key, seen[nseen].slot = slot, seen[nseen++].n = 1, log = true;
+        InterlockedExchange(&lock, 0);
+        if (!log) continue;
+        char line[512];
+        int len = snprintf(line, sizeof line, "[hw] w%d %llx by %s+%llx", slot, (unsigned long long)g_hw_addr[slot], nm ? nm : "host",
+                           (unsigned long long)(nm ? off : pc));
+        for (int i = 0; i < nc && len < 460; i++) {
+            uint64_t o = 0;
+            const char *c = rt_host_fn_name(chain[i], &o);
+            len += snprintf(line + len, sizeof line - len, " < %s+%llx", c, (unsigned long long)o);
+        }
+        fprintf(stderr, "%s\n", line);
+    }
+    ep->ContextRecord->Dr6 = 0;
+    return true;
+}
+
 static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && hw_hit(ep)) return EXCEPTION_CONTINUE_EXECUTION;
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     uint64_t fa = er->ExceptionInformation[1];
     // (not for an execute fault: on a read-write page, retrying it would fault again forever)
     if (er->ExceptionInformation[0] != EXCEPTION_EXECUTE_FAULT && lazy_commit(fa)) return EXCEPTION_CONTINUE_EXECUTION;
     extern int g_watch_write;
     g_watch_write = (int)er->ExceptionInformation[0];
+    {   // (the watch log's caller, LARECOMP_WATCH_ADDR / LARECOMP_CAM_WATCH: x64 has no link register and the write is
+        // mostly memcpy's - the first words on the stack that are addresses inside game functions, innermost first)
+        extern uint64_t g_watch_lo, g_fault_lr, g_fault_chain[6];
+        extern const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);
+        if (g_watch_lo) {
+            const uint64_t *sp = (const uint64_t *)(uintptr_t)ep->ContextRecord->Rsp;
+            int n = 0;
+            memset(g_fault_chain, 0, sizeof(uint64_t) * 6);
+            for (int i = 0; i < 400 && n < 6; i++)
+                if (sp[i] > 0x10000 && rt_host_fn_name(sp[i], NULL)) g_fault_chain[n++] = sp[i];
+            g_fault_lr = g_fault_chain[0];
+        }
+    }
     if (g_report_crashes && rt_fault_watch(fa, ep->ContextRecord->Rip)) return EXCEPTION_CONTINUE_EXECUTION;
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -95,6 +190,23 @@ static void note_guest_conflict(uint64_t lo, uint64_t hi) {
         a = end;
     }
     _putenv_s("LARECOMP_REEXEC_WHY", why);
+}
+
+// (debug, LARECOMP_CAM_WATCH) every 4-aligned place in the guest's committed read-write memory that holds these n
+// bytes; returns how many (at most max). Slow: once, on request.
+int plat_debug_scan(const void *pat, size_t n, uint64_t *out, int max) {
+    int k = 0;
+    MEMORY_BASIC_INFORMATION mi;
+    for (uint64_t a = g_lo; a < g_hi && k < max && VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi); ) {
+        uint64_t base = (uint64_t)(uintptr_t)mi.BaseAddress, end = base + mi.RegionSize;
+        if (end > g_hi) end = g_hi;
+        if (mi.State == MEM_COMMIT && (mi.Protect & 0xFF) == PAGE_READWRITE && !(mi.Protect & PAGE_GUARD) && end - base >= n)
+            for (uint64_t p = base; p + n <= end && k < max; p += 4)
+                if (*(const uint32_t *)(uintptr_t)p == *(const uint32_t *)pat && !memcmp((const void *)(uintptr_t)p, pat, n)) out[k++] = p;
+        if (end <= a) break;
+        a = end;
+    }
+    return k;
 }
 
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {

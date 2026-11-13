@@ -645,6 +645,17 @@ void rec_QueuePresentKHR(VkSemaphore wait, VkSwapchainKHR swapchain, uint32_t im
 }
 bool rec_present_recreate(void) { return atomic_exchange_explicit(&present_recreate, 0, memory_order_acq_rel) != 0; }
 
+typedef struct { void (*fn)(void *); void *arg; } CallArgs;
+static void call_run(const void *p) { const CallArgs *a = p; a->fn(a->arg); }
+void rec_call(void (*fn)(void *), void *arg) {
+    CallArgs a = {fn, arg};
+    if (on <= 0) { call_run(&a); return; }
+    ENQ_T0();
+    *(CallArgs *)push(call_run, sizeof a, 0) = a;
+    publish();
+    ENQ_END();
+}
+
 // ================================================================== commands
 // Scalar arguments: a struct of the command buffer and the values, made by a macro from the parameter list.
 #define CMD_ARGS(name, ...) typedef struct { VkCommandBuffer cb; __VA_ARGS__ } name##Args;

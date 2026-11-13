@@ -40,6 +40,11 @@ Machine-specific paths (game files, install folder) are in `CLAUDE.local.md` whe
   `shader_code_kick`) into `cache/shader_code_game.bin`.
 - `runtime/crash_explain.c`: the crash dialog's plain-language explanation.
 - `runtime/nvn/vulkan/device.c`: present, `[mem]` and `[scale]` log lines, screenshots.
+- `runtime/vr.h`, `runtime/nvn/vulkan/xr.c`, `runtime/hle/vr_input.c`: PC VR (`docs/vr.md`). The OpenXR session, the
+  window's picture on a screen in the headset, the headset's controllers as the pad, the throw found in the hand's
+  motion. `runtime/hle/vr_body.c`: the character's arms and fingers follow the controllers or bare hands (its
+  skeleton written after the animation, `runtime/vr_ik.h` the solver). Off unless `vr = 1` / `LARECOMP_VR=1`; built in only where the OpenXR loader is installed (Makefile `VR`).
+  OpenXR's frame calls use the Vulkan queue: only after `rec_drain()` or inside `rec_call()`.
 - `runtime/nvn/maxwell/translate.c`: Maxwell shader -> GLSL/MSL.
 - `runtime/ui/launcher.mm`: the start screen (game-file setup, save import, update check).
 - `runtime/ui/menu.mm`: the F1 settings menu.

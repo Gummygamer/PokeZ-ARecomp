@@ -114,6 +114,17 @@ GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(B)/lasrecomp.dll.a
 GAMELIB_SHARED := -shared  # (+ the import library: runtime/gamebuild.c)
 endif
 
+# PCVR (runtime/vr.h, runtime/nvn/vulkan/xr.c): built in where the OpenXR loader is installed (MSYS2:
+# mingw-w64-ucrt-x86_64-openxr-sdk; Debian / Ubuntu: libopenxr-dev), and off at run time unless asked for (larecomp.ini
+# "vr = 1" / LARECOMP_VR=1). VR=0 builds without it. Not part of GAMELIB_ID: the game code is the same either way.
+ifneq ($(PLATFORM),macos)
+VR ?= $(shell pkg-config --exists openxr 2>/dev/null && echo 1)
+ifeq ($(VR),1)
+OSFLAGS += -DLARECOMP_VR $(shell pkg-config --cflags openxr)
+LDFLAGS += $(shell pkg-config --libs openxr)
+endif
+endif
+
 # GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the
 # flags). A library with another id is rebuilt by the start screen, never loaded.
 GAMELIB_SRCS := tools/game_addresses.py runtime/game_addresses/versions.h $(wildcard runtime/game_addresses/patches_v*.h) tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py \

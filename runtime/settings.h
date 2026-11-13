@@ -158,6 +158,7 @@ typedef struct {
     // the mods whose code runs (exefs: subsdk programs, .pchtxt patches - runtime/codemods.c, runtime/gamebuild.c):
     // off unless listed, each turned on after a warning on the Mods page (LARECOMP_CODE_MODS=1: all of them)
     char mods_code_on[1024];
+    bool vr;  // PCVR: the picture and the controls in an OpenXR headset, from the next start (runtime/vr.h; LARECOMP_VR)
 } Settings;
 
 

@@ -18,6 +18,7 @@
 
 #include "../../kernel.h"
 #include "shaders.h"
+#include "../../vr.h"
 #include "vk.h"
 #include "record.h"
 #include "vk_fsr2.h"
@@ -3587,6 +3588,9 @@ static TexBackend *hdr_snap_of(TexBackend *shown) {
 static NvnTexture *mv_depth;  // (mv_note_draw below)
 static uint64_t mv_frame[2];
 static float mv_vp[2][16];
+static float mv_view[16];  // (the view matrix of mv_vp[0]'s frame: PCVR, vk_scene_view)
+static pthread_mutex_t mv_lock = PTHREAD_MUTEX_INITIALIZER;  // (vk_scene_view_proj: a game thread reads mv_vp[0])
+static bool mv_have;
 // ---- temporal anti-aliasing, AMD FSR 2 (fsr2_copy below): this frame's jitter, in the scene's pixels, while FSR 2
 // resolved the frame before (a frame it doesn't resolve is never shown jittered: at most the first one)
 static float fsr2_jx, fsr2_jy;
@@ -3769,19 +3773,84 @@ static void mv_note_draw(Prog *pr) {
     int n = 0;
     for (int i = 0; i < 8; i++) n += st.rt.color[i] != NULL;
     // (the shaders' constant buffer k is the stage's binding k - 3: cbuf_info. The G-buffer vertex shaders' clip
-    // position is cb5[0..3] (rows) x their model matrix, cb10)
+    // position uses cb5[0..3] (column-major view-projection) and their model matrix, cb10)
     if (mv_frame[0] == f || !st.rt.depth || !st.ubuf[0][2].addr || st.ubuf[0][2].size < 64) return;
     if (n < 4) return;
     const float *m = (const float *)(uintptr_t)st.ubuf[0][2].addr;
     for (int i = 0; i < 16; i++) if (!isfinite(m[i])) return;
-    if (m[12] == 0 && m[13] == 0 && m[14] == 0) return;  // (perspective: w depends on the position)
+    if (m[3] == 0 && m[7] == 0 && m[11] == 0) return;  // (perspective: clip w depends on world position)
     float a0 = m[0] * m[5] - m[1] * m[4], a1 = m[0] * m[6] - m[2] * m[4], a2 = m[0] * m[7] - m[3] * m[4], a3 = m[1] * m[6] - m[2] * m[5],
           a4 = m[1] * m[7] - m[3] * m[5], a5 = m[2] * m[7] - m[3] * m[6], b0 = m[8] * m[13] - m[9] * m[12], b1 = m[8] * m[14] - m[10] * m[12],
           b2 = m[8] * m[15] - m[11] * m[12], b3 = m[9] * m[14] - m[10] * m[13], b4 = m[9] * m[15] - m[11] * m[13], b5 = m[10] * m[15] - m[11] * m[14];
     if (fabsf(a0 * b5 - a1 * b4 + a2 * b3 + a3 * b2 - a4 * b1 + a5 * b0) < 1e-9f) return;
+    pthread_mutex_lock(&mv_lock);
     mv_frame[1] = mv_frame[0], memcpy(mv_vp[1], mv_vp[0], sizeof mv_vp[0]);
     mv_frame[0] = f, memcpy(mv_vp[0], m, sizeof mv_vp[0]);
+    if (st.ubuf[0][2].size >= 128) memcpy(mv_view, m + 16, sizeof mv_view);  // (the block's second matrix: the view alone)
+    mv_have = true;
+    pthread_mutex_unlock(&mv_lock);
+    {   // (debug, finding the game's camera code) LARECOMP_CAM_WATCH=<frame>[:<k>:<i>]: at that frame the camera block is
+        // logged whole (vec4 by vec4) and guest memory is searched for copies of each of its matrices ("[cam] matrix k
+        // at ..."): the game's own camera holds some of them. With k and i, the game's own copies of matrix k (up
+        // to 4, marked *) get a hardware write breakpoint at byte i: the log names the functions that write them ("[hw]",
+        // platform/windows.c plat_hw_watch).
+        static long at = -2;
+        static int wk = -1, wi;
+        if (at == -2) {
+            const char *e = ENV("LARECOMP_CAM_WATCH");
+            at = e ? atol(e) : -1;
+            if (e && (e = strchr(e, ':'))) sscanf(e + 1, "%d:%d", &wk, &wi);
+        }
+        if (at >= 0 && (long)f >= at) {
+            at = -1;
+            extern int plat_debug_scan(const void *pat, size_t n, uint64_t *out, int max);
+            extern uint64_t g_watch_lo, g_watch_hi;
+            extern void watch_arm(void);
+            uint64_t base = st.ubuf[0][2].addr, size = st.ubuf[0][2].size;
+            float blk[0x220 / 4];
+            memcpy(blk, m, sizeof blk);
+            LOG("[cam] frame %llu: block %llx (%llu bytes)\n", (unsigned long long)f, (unsigned long long)base, (unsigned long long)size);
+            for (int i = 0; i < 0x220 / 16; i++)
+                LOG("[cam]   +%03x  %14.6f %14.6f %14.6f %14.6f\n", i * 16, blk[i * 4], blk[i * 4 + 1], blk[i * 4 + 2], blk[i * 4 + 3]);
+            for (int k = 0; k < 0x220 / 64; k++) {
+                uint64_t hit[48], w[4];
+                int n = plat_debug_scan(blk + k * 16, 64, hit, 48), nw = 0;
+                for (int i = 0; i < n; i++) {
+                    // (not the GPU's buffers, nor the ring of staged blocks 0x240 apart: the game's own copies)
+                    bool own = hit[i] < 0x7700000000ull;
+                    for (int q = 0; q < n; q++) own &= hit[q] != hit[i] + 0x240 && hit[i] != hit[q] + 0x240;
+                    LOG("[cam] matrix %d copy %d at %llx%s\n", k, i, (unsigned long long)hit[i], own ? " *" : "");
+                    if (own && nw < 4) w[nw++] = hit[i] + (uint64_t)wi;
+                }
+                if (k == wk && nw) {
+                    extern void plat_hw_watch(const uint64_t *addr, int n);
+                    for (int i = 0; i < nw; i++) LOG("[cam] hw watch w%d = %llx\n", i, (unsigned long long)w[i]);
+                    plat_hw_watch(w, nw);
+                }
+            }
+        }
+    }
     mv_depth = st.rt.depth;
+}
+
+// The scene camera's view-projection of the last frame drawn (column-major; world -> clip), for the game's threads (PCVR:
+// runtime/hle/vr_input.c turns the hand's motion into the world's directions with it). false: no scene drawn yet.
+bool vk_scene_view_proj(float out[16]) {
+    pthread_mutex_lock(&mv_lock);
+    bool have = mv_have;
+    if (have) memcpy(out, mv_vp[0], sizeof mv_vp[0]);
+    pthread_mutex_unlock(&mv_lock);
+    return have;
+}
+
+// The view matrix the scene of the frame being shown was drawn with (the translating thread, at the frame's end), for
+// PCVR's first person: xr.c finds the head that frame was drawn from by it (hle/vr_camera.c vr_render_view_of).
+// false: no scene in this frame.
+bool vk_scene_view(float out[16]) {
+    extern uint64_t vk_frame_counter(void);
+    if (!mv_have || mv_frame[0] != vk_frame_counter()) return false;
+    memcpy(out, mv_view, sizeof mv_view);
+    return true;
 }
 
 // (renderer_stats, once per stats interval) copies made aliases / renamed / partly or fully copied later
@@ -7142,6 +7211,7 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
     // the keys the draw path makes for this state (draw_)
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
+    vkey.vr_cut = vr_head_cut();  // (the run's own, as the draw path: a first-person run prepares its variants)
     vkey.flip_y = fkey.flip_y = (r->flags & SR_FLIP_Y) != 0;
     vkey.depth_minus_one = (r->flags & SR_DEPTH_MINUS_ONE) != 0;
     vkey.flip_x = fkey.flip_x = (r->flags & SR_FLIP_X) != 0;
@@ -7967,6 +8037,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!st.program) { SKIP(SK_NO_PROGRAM); return; }
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
+    vkey.vr_cut = vr_head_cut();  // (PCVR, first person: the player's own head is cut away around the eyes - maxwell/translate.c)
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
@@ -8092,6 +8163,24 @@ static void draw_(CmdRec *r, bool indexed) {
     mv_note_draw(pr);
     if (taa_kind() != TAA_GAME && fsr2_copy(pr)) return;  // (FSR 2 resolved the frame in place of the game's copy)
     if (g_debug_frame) debug_draw(pr, r, indexed);
+    // CPU-only mesh diagnostics: unlike full capture, no attachment readbacks.
+    if (ENV("LARECOMP_VR_MESH_FRAME") &&
+        renderer_exec_frame() == strtoull(ENV("LARECOMP_VR_MESH_FRAME"), NULL, 10) && st.rt.ncolor >= 4) {
+        LOG("[vr-mesh] vs %llx fs %llx count %llu inst %llu vb %llx size %llu stride %u\n",
+            (unsigned long long)st.program->stages[0].code_addr,
+            (unsigned long long)st.program->stages[1].code_addr,
+            (unsigned long long)r->x[2], (unsigned long long)(indexed ? r->x[6] : r->x[4]),
+            (unsigned long long)st.vbuf[0].addr, (unsigned long long)st.vbuf[0].size, st.stream[0][0]);
+        for (int c = 6; c < 18; c++) {
+            if (!(pr->vi->cbuf_mask & (1u << c))) continue;
+            uint64_t addr = st.ubuf[0][c - 3].addr, size = st.ubuf[0][c - 3].size;
+            if (!addr || size < 4) continue;
+            const float *u = (const float *)(uintptr_t)addr;
+            LOG("[vr-mesh] cb%d %llx size %llu:", c, (unsigned long long)addr, (unsigned long long)size);
+            for (int i = 0; i < 48 && (uint64_t)(i + 1) * 4 <= size; i++) LOG(" %.6g", u[i]);
+            LOG("\n");
+        }
+    }
     if (ct_on()) ct_draw(pr, "draw");
     alias_draw_check();
     resolve_feedback(pr);
@@ -12272,6 +12361,12 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, float fx, flo
     return v;
 }
 
+// (PCVR: vk_present_draw's picture of this frame, for vk_xr_eye)
+static VkImageView xr_src;
+static uint64_t xr_src_frame = ~0ull;
+static float xr_src_pv[8];
+extern uint64_t vk_frame_counter(void);
+
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
@@ -12288,11 +12383,19 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     if (crop_area < 0) crop_area = !ENV("LARECOMP_POST_CROP_AREA") || atoi(ENV("LARECOMP_POST_CROP_AREA")) != 0;
     post_crop_w = crop_area && pv[6] > 0 ? fminf(1, fmaxf(0, pv[4]) + pv[6]) : 1;
     post_crop_h = crop_area && pv[7] > 0 ? fminf(1, fmaxf(0, pv[5]) + pv[7]) : 1;
-    VkImageView src = post_process(cb, b, fx, fy, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh, &upscaled);
+    double ow = pv[6] > 0 ? vw / pv[6] : vw, oh = pv[7] > 0 ? vh / pv[7] : vh;
+    {   // (PCVR, first person: the picture goes to the headset's eyes at their own size, vk_xr_eye - not through the
+        // window's: post-processed at the size it was drawn, and the window shows that scaled by its one bilinear tap)
+        double shape, lines;
+        if (vr_render_shape(&shape, &lines)) ow = b->width * fx, oh = b->height * fy;
+    }
+    VkImageView src = post_process(cb, b, fx, fy, ow, oh, &upscaled);
     float pvc[8];
     memcpy(pvc, pv, sizeof pvc);
     if (!upscaled) { pvc[4] *= fx; pvc[5] *= fy; pvc[6] *= fx; pvc[7] *= fy; }
     pv = pvc;
+    xr_src = src, xr_src_frame = vk_frame_counter();  // (PCVR, vk_xr_eye: this frame's game picture and its place in its texture)
+    memcpy(xr_src_pv, pv, sizeof xr_src_pv);
     VkPipeline p = present_pipeline(g_vk.sc_format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
@@ -12346,6 +12449,125 @@ static void hdr_snapshot(NvnTexture *t) {
                      .extent = {b->width, b->height, 1}};
     rec_CmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     vk_full_barrier(cb);
+}
+
+// PCVR, first person (device.c vk_frame_end -> here, once per eye; shaders.c vr_eye.frag): the game's picture of this
+// frame, drawn once from between the eyes, into one eye's image (dst, in COLOR_ATTACHMENT_OPTIMAL; the part x y w h of
+// it) as that eye sees it - fov: the tangents of its field of view (left, right, up, down), eye: where it is from the
+// camera the game drew with (metres), rv: that camera. The scene's depth (mv_depth, the G-buffer's) says how far each
+// pixel is; without one this frame (a menu over a still picture) or with LARECOMP_VR_STEREO=0 the picture is shown
+// as it is. srgb: dst is an sRGB image (the headset's). false: no game picture this frame - nothing drawn.
+bool vk_xr_eye(VkCommandBuffer cb, VkImageView dst, VkFormat fmt, bool srgb, int32_t x, int32_t y, uint32_t w, uint32_t h,
+               const float fov[4], const float eye[3], const VrRenderView *rv) {
+    static VkPipelineLayout layout;
+    static VkDescriptorSetLayout dsl;
+    static struct { VkFormat f; VkPipeline p; } pipes[4];
+    if (!xr_src || xr_src_frame != vk_frame_counter()) return false;
+    if (ENV("LARECOMP_LOG_VR_PROJECTION")) {
+        static uint64_t logged = ~0ull;
+        uint64_t frame = vk_frame_counter();
+        if (frame / 60 != logged / 60) {
+            logged = frame;
+            // Recover the projection's first two rows from VP * inverse(V).
+            // V is rigid; inverse(V)'s rotation is transpose(V.rotation).
+            float p[6] = {0};
+            for (int row = 0; row < 2; row++)
+                for (int col = 0; col < 3; col++)
+                    for (int k = 0; k < 3; k++)
+                        p[row * 3 + col] += mv_vp[0][k * 4 + row] * mv_view[k * 4 + col];
+            LOG("[vr-projection] frame %llu rows %.5f %.5f %.5f / %.5f %.5f %.5f expected %.5f %.5f crop %.3f %.3f %.3f %.3f flip %.0f age %.1fms\n",
+                (unsigned long long)frame, p[0], p[1], p[2], p[3], p[4], p[5],
+                1 / rv->tan_h, 1 / rv->tan_v, xr_src_pv[4], xr_src_pv[5], xr_src_pv[6], xr_src_pv[7],
+                xr_src_pv[0], (plat_now_ns() - rv->ns) / 1e6);
+        }
+    }
+    if (!layout) {
+        VkDescriptorSetLayoutBinding bd[2];
+        for (uint32_t i = 0; i < 2; i++)
+            bd[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bd};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &dsl));
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112};
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &layout));
+    }
+    VkPipeline pipe = VK_NULL_HANDLE;
+    for (int i = 0; i < 4; i++) if (pipes[i].p && pipes[i].f == fmt) pipe = pipes[i].p;
+    if (!pipe) {
+        VkPipelineShaderStageCreateInfo stages[2] = {
+            {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+             .module = vk_builtin_shader("post.vert"), .pName = "main"},
+            {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+             .module = vk_builtin_shader("vr_eye.frag"), .pName = "main"}};
+        VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                     .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+        VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+        VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                     .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+        VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                                   .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+        VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xF};
+        VkPipelineColorBlendStateCreateInfo cbs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
+                                                   .pAttachments = &cba};
+        VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        uint32_t ndyn = 2;
+        fullscreen_vertex_dyn(dyn, &ndyn, 3);
+        VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = ndyn, .pDynamicStates = dyn};
+        VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+                                            .pColorAttachmentFormats = &fmt};
+        VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
+                                           .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                           .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                           .pColorBlendState = &cbs, .pDynamicState = &dy, .layout = layout};
+        VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pipe));
+        for (int i = 0; i < 4; i++) if (!pipes[i].p) { pipes[i].f = fmt, pipes[i].p = pipe; break; }
+    }
+    static int stereo = -1;
+    static float depth_k;
+    if (stereo < 0) {
+        stereo = !ENV("LARECOMP_VR_STEREO") || atoi(ENV("LARECOMP_VR_STEREO")) != 0;
+        depth_k = ENV("LARECOMP_VR_DEPTH") ? (float)atof(ENV("LARECOMP_VR_DEPTH")) : 1.0f;  // (the eyes' distance, times this)
+    }
+    TexBackend *zb = stereo && mv_depth && mv_frame[0] == vk_frame_counter() ? mv_depth->backend : NULL;
+    static const VkComponentMapping id = {0};
+    VkImageView zv = zb && zb->image ? vk_image_view(zb, VK_IMAGE_VIEW_TYPE_2D, zb->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT) : VK_NULL_HANDLE;
+    float pc[28] = {fov[0], fov[1], fov[2], fov[3], eye[0] * depth_k, eye[1] * depth_k, eye[2] * depth_k, 0,
+                    rv->tan_h, rv->tan_v, rv->near, rv->zeps};
+    memcpy(pc + 12, xr_src_pv + 4, 16);  // (the crop: origin, size)
+    if (zv) {  // (Dynamic: the depth's picture is the top-left part of its image)
+        pc[16] = (float)zb->width * (zb->scalable && zb->ax > 0 ? zb->sx / zb->ax : 1);
+        pc[17] = (float)zb->height * (zb->scalable && zb->ay > 0 ? zb->sy / zb->ay : 1);
+    }
+    pc[20] = xr_src_pv[0] > 0.5f, pc[21] = srgb, pc[22] = zv != VK_NULL_HANDLE;
+    pc[24] = (float)x, pc[25] = (float)y, pc[26] = (float)w, pc[27] = (float)h;
+    VkDescriptorSet set = vk_alloc_set(dsl);
+    VkDescriptorImageInfo ii[2] = {{vk_default_sampler(true), xr_src, VK_IMAGE_LAYOUT_GENERAL},
+                                   {vk_default_sampler(false), zv ? zv : xr_src, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[2];
+    for (uint32_t i = 0; i < 2; i++)
+        wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = i, .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[i]};
+    rec_UpdateDescriptorSets(2, wr);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dst,
+                                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{x, y}, {w, h}}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    rec_CmdBeginRendering(cb, &ri);
+    rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+    VkViewport vp = {(float)x, (float)y, (float)w, (float)h, 0, 1};
+    VkRect2D sc = {{x, y}, {w, h}};
+    rec_CmdSetViewport(cb, 0, 1, &vp);
+    rec_CmdSetScissor(cb, 0, 1, &sc);
+    rec_CmdPushConstants(cb, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112, pc);
+    fullscreen_vertex_bind(cb);
+    rec_CmdDraw(cb, 3, 1, 0, 0);
+    rec_CmdEndRendering(cb);
+    return true;
 }
 
 // HDR output (F1 > Video > HDR; device.c vk_frame_end): the window's SDR image (sdr; base: its copy from before the
