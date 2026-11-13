@@ -2291,6 +2291,8 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     extern void vk_texdump_process(void);
     vk_texdump_process();
     black_probe(b, t, frame);
+    extern void vk_vr_depth_shot(TexBackend *b, uint64_t frame);
+    vk_vr_depth_shot(b, frame);  // (debug, PCVR: LARECOMP_VR_DEPTH_SHOT)
     // the frame's work goes to the GPU now, in a submission of its own: it starts while we wait for the window's image.
     // Its GPU time is counted, and the window image's submission's from after its wait (exec.c gpu_timer_add)
     renderer_submit();

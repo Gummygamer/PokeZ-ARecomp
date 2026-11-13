@@ -302,11 +302,18 @@ static const char *builtin_src(const char *name, int *stage) {
     // filled from next to it. The colour is the game's there (crop: its part of the texture, flags.x: upside down;
     // flags.y: the target is an sRGB image - the game's bytes are sRGB already). dsz: the depth's picture in texels.
     // No depth (flags.z = 0): the game's picture as it is, for both eyes.
+    // flags.w: the depth looked up is the smoothed one (sm, vr_dsmooth.frag; LARECOMP_VR_SMOOTH=0: the depth's own
+    // texel). Each eye sees a strip beside something near that the game's camera did not: filled from the background
+    // next to it at full parallax, the strip's far side was a tear the shape of the character's outline - in each eye
+    // a faint copy of every character a few centimetres to one side (the other side in the other eye). With the
+    // depth's steps made ramps (the near things grown a little first, so their own outlines move with them) the
+    // background stretches around them instead.
     if (!strcmp(name, "vr_eye.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
                "layout(set = 0, binding = 0) uniform sampler2D col;\n"
                "layout(set = 0, binding = 1) uniform sampler2D dep;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D sm;\n"
                "layout(push_constant) uniform P { vec4 fov; vec4 eye; vec4 cen; vec4 crop; vec4 dsz; vec4 flags; vec4 vp; } pc;\n"
                "layout(location = 0) out vec4 o;\n"
                "vec3 lin(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }\n"
@@ -320,14 +327,41 @@ static const char *builtin_src(const char *name, int *stage) {
                "    float z = max(-p.z, 0.01);\n"
                "    uv = vec2(p.x / (z * pc.cen.x) * 0.5 + 0.5, 0.5 - p.y / (z * pc.cen.y) * 0.5);\n"
                "    if (pc.flags.z < 0.5) break;\n"
-               "    ivec2 q = clamp(ivec2(uv * pc.dsz.xy), ivec2(0), ivec2(pc.dsz.xy) - 1);\n"
-               "    float d = texelFetch(dep, q, 0).r;\n"
+               "    float d = pc.flags.w > 0.5 ? textureLod(sm, clamp(uv, vec2(0.0), vec2(1.0)), 0.0).r\n"
+               "            : texelFetch(dep, clamp(ivec2(uv * pc.dsz.xy), ivec2(0), ivec2(pc.dsz.xy) - 1), 0).r;\n"
                "    t = clamp(pc.cen.z / max(d + pc.cen.w, 1e-6), 0.02, 5000.0) + pc.eye.z;\n"
                "  }\n"
                "  uv = clamp(uv, vec2(0.0), vec2(1.0));\n"
                "  if (pc.flags.x > 0.5) uv.y = 1.0 - uv.y;\n"
                "  vec3 c = textureLod(col, pc.crop.xy + uv * pc.crop.zw, 0.0).rgb;\n"
                "  o = vec4(pc.flags.y > 0.5 ? lin(c) : c, 1.0);\n"
+               "}\n";
+    }
+    // PCVR (exec.c vr_depth_smooth): one pass of the depth's smoothing for vr_eye.frag, along a.xy (texels of the
+    // output) over -a.z..a.z: a.w = 1 the largest (reversed depth: the nearest), 0 the mean. b.x = 2: the source is
+    // the full-size depth (b.zw: its picture in texels) and each output texel takes the nearest of its 2 x 2.
+    if (!strcmp(name, "vr_dsmooth.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy), st = ivec2(pc.a.xy), sz = ivec2(pc.b.zw);\n"
+               "  vec2 isz = vec2(textureSize(t, 0));\n"
+               "  int n = int(pc.a.z);\n"
+               "  float m = 0.0, s = 0.0;\n"
+               "  for (int k = -n; k <= n; k++) {\n"
+               "    ivec2 q = p + st * k;\n"
+               "    float v;\n"
+               "    if (pc.b.x > 1.5) {\n"
+               "      vec4 g = textureGather(t, clamp(vec2(q * 2 + 1), vec2(1.0), vec2(sz - 1)) / isz);\n"
+               "      v = max(max(g.x, g.y), max(g.z, g.w));\n"
+               "    } else v = texelFetch(t, clamp(q, ivec2(0), sz - 1), 0).r;\n"
+               "    m = max(m, v);\n"
+               "    s += v;\n"
+               "  }\n"
+               "  o = vec4(pc.a.w > 0.5 ? m : s / float(2 * n + 1), 0.0, 0.0, 1.0);\n"
                "}\n";
     }
     if (!strcmp(name, "texcopy.frag")) {  // (texture dumps: alpha kept - foliage, fences, decals are cut out by it)

@@ -57,6 +57,10 @@ the window as usual.
   to the player. The scene is still drawn once; `vr_eye.frag` synthesizes eye images using scene depth. This can
   distort nearby geometry, silhouettes and HUD elements. `LARECOMP_VR_STEREO=0` disables that depth warp for
   diagnosis while retaining head tracking; it produces a monoscopic scene, not true stereo rendering.
+  Each eye sees a little background beside near things that the one picture does not have: the depth is smoothed
+  first so that background stretches around them (without it, a faint copy of every character's outline showed
+  beside it, a different side in each eye). `LARECOMP_VR_SMOOTH=<texels>` sets how far the smoothing reaches (96;
+  `0` turns it off).
 - **Player body.** The arms follow the hands (above), but the rest of the body is still the game's animation: the
   torso doesn't lean with the head, and walking animations still swing the shoulders under the tracked arms.
   Head-mesh suppression and reliable torso visibility are not implemented. The neck-to-eye offset follows head

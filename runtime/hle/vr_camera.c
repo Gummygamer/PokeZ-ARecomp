@@ -177,15 +177,18 @@ static void quat_rows(const float q[4], float r[3][3]) {  // r[row][col]: turns 
 }
 
 static bool fake_head(VrPose *h) {
-    static float v[5];
+    static float v[7];
     static int init;
     if (!init) {
         const char *e = ENV("LARECOMP_VR_FAKE_HEAD");
-        if (e) sscanf(e, "%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]);
+        if (e) sscanf(e, "%f,%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]);
         init = 1;
     }
     bool first = !origin.have;  // (until the recentring has taken "ahead" from a head that looks ahead: the yaw comes after)
-    float yaw = first ? 0 : v[0], cy = cosf(yaw * 0.0087266f), sy = sinf(yaw * 0.0087266f), cp = cosf(v[1] * 0.0087266f), sp = sinf(v[1] * 0.0087266f);
+    // (a sixth and seventh value: the head sways that many degrees to each side, once in that many seconds - a head that
+    // is never quite still, as a real one)
+    float sway = v[5] && v[6] > 0 ? v[5] * sinf((float)(plat_now_ns() % 1000000000000ull) * 1e-9f * 6.2831853f / v[6]) : 0;
+    float yaw = first ? 0 : v[0] + sway, cy = cosf(yaw * 0.0087266f), sy = sinf(yaw * 0.0087266f), cp = cosf(v[1] * 0.0087266f), sp = sinf(v[1] * 0.0087266f);
     *h = (VrPose){.pos = {first ? 0 : v[2], first ? 0 : v[3], first ? 0 : v[4]}, .rot = {cy * sp, sy * cp, -sy * sp, cy * cp}, .valid = true};  // (yaw, then pitch)
     return true;
 }

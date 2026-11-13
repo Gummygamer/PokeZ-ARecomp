@@ -3843,6 +3843,48 @@ bool vk_scene_view_proj(float out[16]) {
     return have;
 }
 
+// (debug, PCVR) LARECOMP_VR_DEPTH_SHOT=<frame>: the scene's depth (mv_depth, what vr_eye.frag reads) of the first frame
+// shown from then on (frame: the presents' count, the [shot] numbers) with first person on, raw into
+// build/vr_depth.bin - u32 width, height, content width, height, format, then 4 bytes per texel - and the game's picture
+// of the same frame into build/vr_color.png (b), with its camera in the log ("[vr-depth]"). Device.c
+// backend_present_now, between the game's frame and the window's.
+void vk_vr_depth_shot(TexBackend *b, uint64_t frame) {
+    static long at = -2;
+    if (at == -2) at = ENV("LARECOMP_VR_DEPTH_SHOT") ? atol(ENV("LARECOMP_VR_DEPTH_SHOT")) : -1;
+    extern uint64_t vk_frame_counter(void);
+    uint64_t f = vk_frame_counter();
+    double vs, vl;
+    if (at < 0 || frame < (uint64_t)at || !vr_render_shape(&vs, &vl)) return;
+    TexBackend *zb = mv_depth && mv_frame[0] == f ? mv_depth->backend : NULL;
+    if (!zb || !zb->image || !(zb->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
+    at = -1;
+    mkdir("build", 0755);
+    uint32_t cw = (uint32_t)content_extent((int)zb->width, zb->scalable, zb->sx, zb->ax);
+    uint32_t ch = (uint32_t)content_extent((int)zb->height, zb->scalable, zb->sy, zb->ay);
+    uint64_t n = (uint64_t)zb->width * zb->height * 4;
+    VkSpan out = vk_readback(n);
+    VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+                           .imageExtent = {zb->width, zb->height, 1}};
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    rec_CmdCopyImageToBuffer(cb, zb->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    renderer_flush();
+    FILE *fp = fopen("build/vr_depth.bin", "wb");
+    if (fp) {
+        uint32_t hd[5] = {zb->width, zb->height, cw, ch, (uint32_t)zb->format};
+        fwrite(hd, 4, 5, fp);
+        fwrite(out.ptr, 1, n, fp);
+        fclose(fp);
+    }
+    if (b) renderer_save_texture_tex(b, "build/vr_color.png");
+    VrRenderView rv;
+    bool have = vr_render_view_of(mv_view, &rv);
+    LOG("[vr-depth] shown frame %llu, frame %llu: %ux%u (content %ux%u) format %d, camera %s tan %.4f %.4f near %.4f zeps %.6g\n",
+        (unsigned long long)frame, (unsigned long long)f, zb->width, zb->height, cw, ch, (int)zb->format, have ? "found" : "not found",
+        have ? rv.tan_h : 0, have ? rv.tan_v : 0, have ? rv.near : 0, have ? rv.zeps : 0);
+}
+
 // The view matrix the scene of the frame being shown was drawn with (the translating thread, at the frame's end), for
 // PCVR's first person: xr.c finds the head that frame was drawn from by it (hle/vr_camera.c vr_render_view_of).
 // false: no scene in this frame.
@@ -12451,6 +12493,41 @@ static void hdr_snapshot(NvnTexture *t) {
     vk_full_barrier(cb);
 }
 
+// PCVR (vk_xr_eye, before the first eye of a frame): the scene's depth (zv, its picture cw x ch texels) made smooth for
+// vr_eye.frag - at half size, the near things grown by a quarter of the reach across (an eighth up and down), then
+// averaged over the reach across (half of it up and down): the depth's steps become ramps, and the background
+// stretches around what is near instead of tearing beside it (shaders.c vr_eye.frag, vr_dsmooth.frag). The reach:
+// LARECOMP_VR_SMOOTH=<texels of the depth> (96; 0: none - the depth's own texels, with the tear). Four passes of the
+// half-size image, R32F (post images 13 and 14). Made once per frame: the second eye reads the first's.
+static VkImageView vr_depth_smooth(VkCommandBuffer cb, VkImageView zv, uint32_t cw, uint32_t ch) {
+    static int reach = -1;
+    static uint64_t made = ~0ull;
+    static VkImageView out;
+    if (reach < 0) {
+        reach = ENV("LARECOMP_VR_SMOOTH") ? atoi(ENV("LARECOMP_VR_SMOOTH")) : 96;
+        if (reach < 0 || reach > 512) reach = 96;
+    }
+    if (!reach || cw < 8 || ch < 8) return VK_NULL_HANDLE;
+    uint64_t f = vk_frame_counter();
+    if (made == f) return out;
+    uint32_t hw = (cw + 1) / 2, hh = (ch + 1) / 2;
+    float r = reach / 2.0f;  // (in half-size texels)
+    TexBackend *a = post_image_f(13, hw, hh, VK_FORMAT_R32_SFLOAT), *b = post_image_f(14, hw, hh, VK_FORMAT_R32_SFLOAT);
+    float p1[8] = {1, 0, roundf(r / 4), 1, 2, 0, (float)cw, (float)ch}, p2[8] = {0, 1, roundf(r / 8), 1, 1, 0, (float)hw, (float)hh};
+    float p3[8] = {1, 0, roundf(r / 2), 0, 1, 0, (float)hw, (float)hh}, p4[8] = {0, 1, roundf(r / 4), 0, 1, 0, (float)hw, (float)hh};
+    VkImageView in = zv;
+    post_pass(cb, "vr_dsmooth.frag", &in, 1, a, p1, false);
+    in = post_view(a);
+    post_pass(cb, "vr_dsmooth.frag", &in, 1, b, p2, false);
+    in = post_view(b);
+    post_pass(cb, "vr_dsmooth.frag", &in, 1, a, p3, false);
+    in = post_view(a);
+    post_pass(cb, "vr_dsmooth.frag", &in, 1, b, p4, false);
+    vk_full_barrier(cb);
+    made = f, out = post_view(b);
+    return out;
+}
+
 // PCVR, first person (device.c vk_frame_end -> here, once per eye; shaders.c vr_eye.frag): the game's picture of this
 // frame, drawn once from between the eyes, into one eye's image (dst, in COLOR_ATTACHMENT_OPTIMAL; the part x y w h of
 // it) as that eye sees it - fov: the tangents of its field of view (left, right, up, down), eye: where it is from the
@@ -12482,10 +12559,10 @@ bool vk_xr_eye(VkCommandBuffer cb, VkImageView dst, VkFormat fmt, bool srgb, int
         }
     }
     if (!layout) {
-        VkDescriptorSetLayoutBinding bd[2];
-        for (uint32_t i = 0; i < 2; i++)
+        VkDescriptorSetLayoutBinding bd[3];
+        for (uint32_t i = 0; i < 3; i++)
             bd[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
-        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bd};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = bd};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &dsl));
         VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112};
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
@@ -12541,16 +12618,18 @@ bool vk_xr_eye(VkCommandBuffer cb, VkImageView dst, VkFormat fmt, bool srgb, int
         pc[16] = (float)zb->width * (zb->scalable && zb->ax > 0 ? zb->sx / zb->ax : 1);
         pc[17] = (float)zb->height * (zb->scalable && zb->ay > 0 ? zb->sy / zb->ay : 1);
     }
-    pc[20] = xr_src_pv[0] > 0.5f, pc[21] = srgb, pc[22] = zv != VK_NULL_HANDLE;
+    VkImageView smv = zv ? vr_depth_smooth(cb, zv, (uint32_t)pc[16], (uint32_t)pc[17]) : VK_NULL_HANDLE;
+    pc[20] = xr_src_pv[0] > 0.5f, pc[21] = srgb, pc[22] = zv != VK_NULL_HANDLE, pc[23] = smv != VK_NULL_HANDLE;
     pc[24] = (float)x, pc[25] = (float)y, pc[26] = (float)w, pc[27] = (float)h;
     VkDescriptorSet set = vk_alloc_set(dsl);
-    VkDescriptorImageInfo ii[2] = {{vk_default_sampler(true), xr_src, VK_IMAGE_LAYOUT_GENERAL},
-                                   {vk_default_sampler(false), zv ? zv : xr_src, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[2];
-    for (uint32_t i = 0; i < 2; i++)
+    VkDescriptorImageInfo ii[3] = {{vk_default_sampler(true), xr_src, VK_IMAGE_LAYOUT_GENERAL},
+                                   {vk_default_sampler(false), zv ? zv : xr_src, VK_IMAGE_LAYOUT_GENERAL},
+                                   {vk_default_sampler(true), smv ? smv : xr_src, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[3];
+    for (uint32_t i = 0; i < 3; i++)
         wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = i, .descriptorCount = 1,
                                        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[i]};
-    rec_UpdateDescriptorSets(2, wr);
+    rec_UpdateDescriptorSets(3, wr);
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dst,
                                     .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
