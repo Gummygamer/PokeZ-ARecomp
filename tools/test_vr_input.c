@@ -1,4 +1,5 @@
 #include "../runtime/vr.h"
+#include "../runtime/input_bind.h"
 #include "../runtime/settings.h"
 #include <assert.h>
 #include <stdio.h>
@@ -12,6 +13,7 @@ bool vk_scene_view_proj(float out[16]) { (void)out; return false; }
 bool vr_render_view(int back, VrRenderView *out) { (void)back; (void)out; return false; }
 bool vr_room_forward(const VrPose *head, float out[2]) { (void)head; (void)out; return false; }
 void vr_recenter(void) {}
+bool vr_world_rotation(float out[3][3], float *scale) { (void)out; (void)scale; return false; }
 
 int main(void) {
     VrInput out, in = {.t = 1, .head = {.valid = true, .rot = {0,0,0,1}},
@@ -52,6 +54,20 @@ int main(void) {
     in.head.valid = false;
     vr_input_update(&in);
     assert(!vr_tracking_snapshot(&out));
-    puts("VR input snapshot/expiry tests passed");
+    // Battle chords must reach the guest unchanged while ZL is held.
+    const uint32_t face[] = {VRB_A, VRB_B, VRB_X, VRB_Y};
+    const int bind[] = {BIND_A, BIND_B, BIND_X, BIND_Y};
+    for (int i = 0; i < 4; i++) {
+        in = (VrInput){.buttons = face[i], .trigger = {1, 0}};
+        vr_input_update(&in);
+        memset(axes, 0, sizeof axes);
+        assert(vr_pad_state(axes) == ((1ull << BIND_ZL) | (1ull << bind[i])));
+    }
+    // The left grip deliberately shifts X/Y/B, even during focus: document the trap.
+    in = (VrInput){.buttons = VRB_X | VRB_Y | VRB_B, .trigger = {1, 0}, .grip = {1, 0}};
+    vr_input_update(&in);
+    assert(vr_pad_state(axes) == ((1ull << BIND_ZL) | (1ull << BIND_L) |
+                                (1ull << BIND_MINUS) | (1ull << BIND_PLUS)));
+    puts("VR input snapshot/expiry and battle chord tests passed");
     return 0;
 }

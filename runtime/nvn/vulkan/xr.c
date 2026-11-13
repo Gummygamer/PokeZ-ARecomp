@@ -307,6 +307,9 @@ static void poll_events(void) {
                 XrSessionBeginInfo bi = {.type = XR_TYPE_SESSION_BEGIN_INFO, .primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO};
                 XrResult r = xrBeginSession(xr.session, &bi);
                 xr.running = XR_SUCCEEDED(r);
+                // A resumed runtime can supply a new local-space origin. Calibrate the next
+                // tracked head at the character's eyes instead of reusing the old room height.
+                if (xr.running) vr_recenter();
                 LOG("[vr] headset on: %s\n", xr.running ? "session running" : xr_err(r));
             } else if (s == XR_SESSION_STATE_STOPPING) {
                 clear_input();

@@ -278,6 +278,18 @@ void rt_za_camera(uint64_t manager, uint64_t handle, uint64_t parameters) {
         pm[13] + eye_h - r[1][2] * eye_f + hy,
         pm[14] - r[2][2] * eye_f - s * hx + c * hz
     };
+    if (ENV("LARECOMP_LOG_VR_CAMERA_HEIGHT")) {
+        static uint64_t last_log;
+        uint64_t now = plat_now_ns();
+        pthread_mutex_lock(&camera_lock);
+        if (now - last_log >= 1000000000ull) {
+            last_log = now;
+            LOG("[vr-height] player %llx root (%.3f %.3f %.3f) eye (%.3f %.3f %.3f) height %.3f room-dy %.3f focus %.2f %.2f\n",
+                (unsigned long long)player, pm[12], pm[13], pm[14], eye[0], eye[1], eye[2], eye[1] - pm[13], hp[1],
+                in.trigger[0], in.trigger[1]);
+        }
+        pthread_mutex_unlock(&camera_lock);
+    }
     // The same rigid transform as the rendered head, including recenter and stick yaw.
     // Publish targets only; the animation hook owns all skeleton writes.
     float raw[3][3], room[3][3];

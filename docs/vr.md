@@ -16,6 +16,32 @@ This is the first stage of a full VR version. What it does now, and what it does
 If no headset or no OpenXR runtime is found, the log says why (`[vr] ...` in `logs/play.log`) and the game plays on
 the window as usual.
 
+## Battling with VR controllers
+
+With the default right-hand throwing layout:
+
+1. Face the opponent and **hold the left trigger (ZL)** to focus and show the move menu.
+2. Keep that trigger held and press the button shown beside a ready move: **A or B on the right controller,
+   X or Y on the left controller**. Moves on cooldown must recharge before they can be used again.
+3. Keep the **left grip released** when choosing moves. It is a modifier: holding it changes X to L,
+   Y to minus and B to plus, so those buttons no longer select their normal moves.
+
+The right trigger is ZR (throwing), not the focus button. With `LARECOMP_VR_THROW_HAND=left`, focus moves to the
+right trigger instead. VR face buttons use their printed letters, not the spatial arrangement of a Switch pad.
+
+In first person, the HUD is moved into a central panel, independent of scene depth, about two metres away.
+Its original peripheral copy is removed before drawing the panel, so the HUD is shown once.
+`LARECOMP_VR_HUD=<degrees>` sets its horizontal width (default 70, range 30-100); a smaller value brings the edges
+closer to the centre but also makes text smaller. `LARECOMP_VR_HUD=0` restores the original rendering. Restart after
+changing it. The panel uses the difference between the game's image before and after its UI: translucent UI is
+an approximation, and world-attached labels also move into the panel. Frames without a current UI snapshot retain
+the original rendering.
+
+The next tracked pose after a headset session resumes recalibrates to the character's eye level. To recalibrate
+manually, look ahead at your normal playing height and hold both stick clicks for half a second.
+`LARECOMP_LOG_VR_CAMERA_HEIGHT=1` logs the player root, camera eye, relative height and room-height offset once per
+second, for diagnosing changes during battle.
+
 ## What you get
 
 - **A screen in front of you.** The window's picture - the start screen, the game, the F1 menu - on a screen about

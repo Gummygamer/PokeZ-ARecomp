@@ -3576,7 +3576,7 @@ void vk_alias_texture_destroyed(NvnTexture *t) {
 // copies that opaque - edge anti-aliased on the way, so not the same pixels - into the image it presents, and draws the
 // HUD over it with blending. After an opaque draw into an image that has been presented, that image is copied
 // (hdr_snapshot, two: the game alternates two such images): what differs from the copy when it is shown is the HUD.
-static struct { NvnTexture *shown; TexBackend img; } hdr_snaps[2];
+static struct { NvnTexture *shown; TexBackend img; uint64_t frame; } hdr_snaps[2];
 static TexBackend *hdr_game;  // (vk_present_draw: this frame's game image, its place in the window, uv crop and flip)
 static float hdr_place[9];
 static void hdr_snapshot(NvnTexture *t);
@@ -8065,7 +8065,7 @@ static void draw(CmdRec *r, bool indexed) {
                 (unsigned long long)xfb_addr[2], (unsigned long long)xfb_size[2]);
     }
     draw_(r, indexed);
-    if (g_vk.hdr && st.rt.color[0] && !st.color_state[0] && st.rt.color[0]->backend &&
+    if ((g_vk.hdr || vr_wanted()) && st.rt.color[0] && !st.color_state[0] && st.rt.color[0]->backend &&
         ((TexBackend *)st.rt.color[0]->backend)->presented)
         hdr_snapshot(st.rt.color[0]);  // (the game's picture in the image it shows, before the HUD over it)
     PROF_ADD(prof_draw);
@@ -12404,7 +12404,8 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, float fx, flo
 }
 
 // (PCVR: vk_present_draw's picture of this frame, for vk_xr_eye)
-static VkImageView xr_src;
+static VkImageView xr_src, xr_hud_shown, xr_hud_scene;
+static float xr_hud_crop[4], xr_hud_aspect = 1;
 static uint64_t xr_src_frame = ~0ull;
 static float xr_src_pv[8];
 extern uint64_t vk_frame_counter(void);
@@ -12438,6 +12439,23 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     pv = pvc;
     xr_src = src, xr_src_frame = vk_frame_counter();  // (PCVR, vk_xr_eye: this frame's game picture and its place in its texture)
     memcpy(xr_src_pv, pv, sizeof xr_src_pv);
+    xr_hud_shown = xr_hud_scene = VK_NULL_HANDLE;
+    // Compare raw, matching images (post-processing can change colour and resolution).
+    // Never use the previous frame's snapshot: that would mistake motion for UI.
+    if (vr_wanted()) for (int i = 0; i < 2; i++) {
+        if (hdr_snaps[i].shown && hdr_snaps[i].shown->backend == b &&
+            hdr_snaps[i].img.image && hdr_snaps[i].frame == vk_frame_counter()) {
+            xr_hud_shown = raw_view(b);
+            xr_hud_scene = post_view(&hdr_snaps[i].img);
+            xr_hud_crop[0] = pvc[4], xr_hud_crop[1] = pvc[5];
+            xr_hud_crop[2] = pvc[6], xr_hud_crop[3] = pvc[7];
+            // pvc may refer to an upscaled post-process output; raw images use the original crop.
+            if (upscaled) for (int j = 0; j < 4; j++) xr_hud_crop[j] *= j % 2 ? fy : fx;
+            float width = b->width * xr_hud_crop[2], height = b->height * xr_hud_crop[3];
+            xr_hud_aspect = width > 0 && height > 0 ? width / height : 1;
+            break;
+        }
+    }
     VkPipeline p = present_pipeline(g_vk.sc_format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
@@ -12490,6 +12508,7 @@ static void hdr_snapshot(NvnTexture *t) {
     VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                      .extent = {b->width, b->height, 1}};
     rec_CmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    hdr_snaps[k].frame = vk_frame_counter();
     vk_full_barrier(cb);
 }
 
@@ -12559,12 +12578,12 @@ bool vk_xr_eye(VkCommandBuffer cb, VkImageView dst, VkFormat fmt, bool srgb, int
         }
     }
     if (!layout) {
-        VkDescriptorSetLayoutBinding bd[3];
-        for (uint32_t i = 0; i < 3; i++)
+        VkDescriptorSetLayoutBinding bd[5];
+        for (uint32_t i = 0; i < 5; i++)
             bd[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
-        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = bd};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 5, .pBindings = bd};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &dsl));
-        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112};
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &layout));
@@ -12611,7 +12630,7 @@ bool vk_xr_eye(VkCommandBuffer cb, VkImageView dst, VkFormat fmt, bool srgb, int
     TexBackend *zb = stereo && mv_depth && mv_frame[0] == vk_frame_counter() ? mv_depth->backend : NULL;
     static const VkComponentMapping id = {0};
     VkImageView zv = zb && zb->image ? vk_image_view(zb, VK_IMAGE_VIEW_TYPE_2D, zb->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT) : VK_NULL_HANDLE;
-    float pc[28] = {fov[0], fov[1], fov[2], fov[3], eye[0] * depth_k, eye[1] * depth_k, eye[2] * depth_k, 0,
+    float pc[32] = {fov[0], fov[1], fov[2], fov[3], eye[0] * depth_k, eye[1] * depth_k, eye[2] * depth_k, 0,
                     rv->tan_h, rv->tan_v, rv->near, rv->zeps};
     memcpy(pc + 12, xr_src_pv + 4, 16);  // (the crop: origin, size)
     if (zv) {  // (Dynamic: the depth's picture is the top-left part of its image)
@@ -12621,15 +12640,28 @@ bool vk_xr_eye(VkCommandBuffer cb, VkImageView dst, VkFormat fmt, bool srgb, int
     VkImageView smv = zv ? vr_depth_smooth(cb, zv, (uint32_t)pc[16], (uint32_t)pc[17]) : VK_NULL_HANDLE;
     pc[20] = xr_src_pv[0] > 0.5f, pc[21] = srgb, pc[22] = zv != VK_NULL_HANDLE, pc[23] = smv != VK_NULL_HANDLE;
     pc[24] = (float)x, pc[25] = (float)y, pc[26] = (float)w, pc[27] = (float)h;
+    static float hud_width = -1;
+    if (hud_width < 0) {
+        const char *e = ENV("LARECOMP_VR_HUD");
+        hud_width = e ? strtof(e, NULL) : 70.0f;
+        if (!isfinite(hud_width) || (hud_width != 0 && (hud_width < 30 || hud_width > 100))) hud_width = 70;
+    }
+    pc[7] = hud_width > 0 && xr_hud_shown && xr_hud_scene;
+    pc[18] = tanf(hud_width * 0.00872664626f);
+    // Fit the entire source HUD, preserving its aspect ratio, at a two-metre viewing distance.
+    pc[19] = pc[18] / xr_hud_aspect;
+    memcpy(pc + 28, xr_hud_crop, sizeof xr_hud_crop);
     VkDescriptorSet set = vk_alloc_set(dsl);
-    VkDescriptorImageInfo ii[3] = {{vk_default_sampler(true), xr_src, VK_IMAGE_LAYOUT_GENERAL},
+    VkDescriptorImageInfo ii[5] = {{vk_default_sampler(true), xr_src, VK_IMAGE_LAYOUT_GENERAL},
                                    {vk_default_sampler(false), zv ? zv : xr_src, VK_IMAGE_LAYOUT_GENERAL},
-                                   {vk_default_sampler(true), smv ? smv : xr_src, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[3];
-    for (uint32_t i = 0; i < 3; i++)
+                                   {vk_default_sampler(true), smv ? smv : xr_src, VK_IMAGE_LAYOUT_GENERAL},
+                                   {vk_default_sampler(true), xr_hud_shown ? xr_hud_shown : xr_src, VK_IMAGE_LAYOUT_GENERAL},
+                                   {vk_default_sampler(true), xr_hud_scene ? xr_hud_scene : xr_src, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[5];
+    for (uint32_t i = 0; i < 5; i++)
         wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = i, .descriptorCount = 1,
                                        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[i]};
-    rec_UpdateDescriptorSets(3, wr);
+    rec_UpdateDescriptorSets(5, wr);
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dst,
                                     .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
@@ -12642,7 +12674,7 @@ bool vk_xr_eye(VkCommandBuffer cb, VkImageView dst, VkFormat fmt, bool srgb, int
     VkRect2D sc = {{x, y}, {w, h}};
     rec_CmdSetViewport(cb, 0, 1, &vp);
     rec_CmdSetScissor(cb, 0, 1, &sc);
-    rec_CmdPushConstants(cb, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112, pc);
+    rec_CmdPushConstants(cb, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128, pc);
     fullscreen_vertex_bind(cb);
     rec_CmdDraw(cb, 3, 1, 0, 0);
     rec_CmdEndRendering(cb);
