@@ -39,6 +39,8 @@ static uint64_t ring_seq;
 // (sine, cosine) is ahead. The headset's own origin is wherever its software was last recentred - often not where the
 // player sits now: taken from it, the camera stood behind the character's head.
 static struct { float pos[3], s, c; bool have, want; } origin = {.c = 1, .want = true};
+// The play space -> the world of the last first-person camera (vr_world_rotation): the thrown ball's velocity
+static struct { float rot[3][3], scale; uint64_t ns; } world_of_room;
 
 void vr_recenter(void) {
     pthread_mutex_lock(&camera_lock);
@@ -93,6 +95,14 @@ bool vr_render_view_of(const float view[16], VrRenderView *out) {
         for (int i = 0; i < 16; i++) d = fmaxf(d, fabsf(rv->view[i] - view[i]) / (1 + fabsf(view[i])));
         if (d < 1e-5f) *out = *rv, have = true;
     }
+    pthread_mutex_unlock(&camera_lock);
+    return have;
+}
+
+bool vr_world_rotation(float rot[3][3], float *scale) {
+    pthread_mutex_lock(&camera_lock);
+    bool have = world_of_room.ns && plat_now_ns() - world_of_room.ns < 500000000ull;
+    if (have) memcpy(rot, world_of_room.rot, sizeof world_of_room.rot), *scale = world_of_room.scale;
     pthread_mutex_unlock(&camera_lock);
     return have;
 }
@@ -276,6 +286,10 @@ void rt_za_camera(uint64_t manager, uint64_t handle, uint64_t parameters) {
         room[i][j] = 0;
         for (int k = 0; k < 3; k++) room[i][j] += r[i][k] * raw[j][k];
     }
+    pthread_mutex_lock(&camera_lock);
+    memcpy(world_of_room.rot, room, sizeof room);
+    world_of_room.scale = scale, world_of_room.ns = plat_now_ns();
+    pthread_mutex_unlock(&camera_lock);
     in.head = head;  // (a test's head that stays where it is: no hands with it)
     vr_body_targets(player, &in, eye, room, scale);
     // the view: the transpose of the head's turn in the world, and the eye brought to the origin

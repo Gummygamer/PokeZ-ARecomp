@@ -12,8 +12,9 @@ extern "C" {
 #endif
 
 // A pose in the play space (OpenXR's LOCAL space: metres, +x right, +y up, -z ahead of where the headset was at the
-// start or at the last recentre), with its velocity (m/s) there.
-typedef struct { float pos[3], rot[4] /* x y z w */, vel[3]; bool valid; } VrPose;
+// start or at the last recentre), with its velocity (m/s) and its angular velocity (rad/s, about the play space's
+// axes) there.
+typedef struct { float pos[3], rot[4] /* x y z w */, vel[3], avel[3]; bool valid; } VrPose;
 
 enum { VR_LEFT = 0, VR_RIGHT = 1 };
 // XR_EXT_hand_tracking joint order: palm, wrist, then thumb/index/middle/ring/little.
@@ -32,7 +33,9 @@ typedef struct {
 } VrInput;
 
 // A throw found in the hand's motion (vr_input.c): what the hand did at the moment the ball left it. seq counts them.
-typedef struct { uint64_t seq; double t; int hand; float pos[3], vel[3], speed; VrPose head; } VrThrow;
+// vel / avel: the release's velocity and spin in the play space, each the mean of the hand's samples around the peak
+// of the swing (one frame's velocity is noisy: the ball went a few degrees off where the arm went).
+typedef struct { uint64_t seq; double t; int hand; float pos[3], vel[3], avel[3], speed; VrPose head; } VrThrow;
 
 bool vr_wanted(void);  // asked for (the setting / LARECOMP_VR): decided once, before the GPU device is made
 bool vr_active(void);  // a session is running and its controllers were read in the last half second
@@ -61,6 +64,11 @@ bool vr_render_view(int back, VrRenderView *out);
 void vr_recenter(void);
 // The head's ahead along the floor, in that recentred room (ahead = 0, -1); false: looking straight up or down
 bool vr_room_forward(const VrPose *head, float f[2]);
+// First person: the turn from the play space to the game's world that the last camera was made with (row-major: world =
+// rot * play space; the recentring's yaw and the game camera's, so it does not change with the head) and the world's
+// metres per play-space metre (LARECOMP_VR_WORLD_SCALE). What turns a hand's velocity into a ball's. False: no first
+// person camera in the last half second (theater, a menu).
+bool vr_world_rotation(float rot[3][3], float *scale);
 
 // (xr.c -> vr_input.c) the controllers' state of this frame
 void vr_input_update(const VrInput *in);

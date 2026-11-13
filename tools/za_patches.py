@@ -96,7 +96,10 @@ def _za_smooth_anim(gen, a):
 # LinearVelocity, AngularVelocity, LerpRate, XZOnly; its run function is f_70028c773c in 2.0.0) reads the ball body's
 # velocities, moves them towards its parameters by LerpRate and sets them (bl f_7001198404: x0 the body, x1 / x2 the
 # linear and angular velocity, a vec4 each at sp + 0x20 and sp). The address is that function's last store before the
-# call (str q1, [sp]): the host sees the body and both vectors there and may write another velocity - the hand's.
+# call (str q1, [sp]): the host sees the body and both vectors there and may write another velocity - the hand's. It
+# also gets the node (x19) and its context (x20: the parameters' block at [x20], the node's offsets into it at x19 +
+# 0x48 LerpRate, + 0x54 / + 0x58 the two velocities), to take the lerp back out of the thrown ball's later frames. (A
+# patch site keeps x19..x28 in the Cpu struct: regpromote.py.)
 # Builds not listed: no hook (the ball flies as the game throws it).
 ZA_BALL = {'8a1c86c437394b69': 0x70028c791c}  # 2.0.0
 
@@ -104,8 +107,8 @@ ZA_BALL = {'8a1c86c437394b69': 0x70028c791c}  # 2.0.0
 def _za_ball_velocity(gen, a):
     w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
     assert w == 0x3d8003e1, hex(w)  # str q1, [sp]
-    return ('{ extern void rt_za_ball_velocity(uint64_t, uint64_t, uint64_t); uint64_t ea = c->sp + 0x0ull; '
-            'ST128(ea, c->v[1]); rt_za_ball_velocity(c->x[0], c->sp + 0x20ull, c->sp); }'
+    return ('{ extern void rt_za_ball_velocity(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t); uint64_t ea = c->sp + 0x0ull; '
+            'ST128(ea, c->v[1]); rt_za_ball_velocity(c->x[0], c->sp + 0x20ull, c->sp, c->x[19], c->x[20]); }'
             f'  /* {a:#x}: str q1, [sp] (SetBallVelocity, before the body gets its velocities) */')
 
 

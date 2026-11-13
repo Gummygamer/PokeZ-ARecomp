@@ -21,3 +21,42 @@ static inline bool vr_world_velocity(const float vp[16], const float velocity[3]
     for (int i = 0; i < 3; ++i) out[i] = v[i];
     return true;
 }
+
+// A play-space vector in the world: rot (row-major, world = rot * v; vr_world_rotation) times v, times scale. False on
+// anything not finite. Unlike vr_world_velocity, a throw's pitch is kept: the camera's own pitch is not in rot.
+static inline bool vr_rot_apply(const float rot[3][3], const float v[3], float scale, float out[3]) {
+    float r[3];
+    for (int i = 0; i < 3; ++i) {
+        r[i] = scale * (rot[i][0] * v[0] + rot[i][1] * v[1] + rot[i][2] * v[2]);
+        if (!isfinite(r[i])) return false;
+    }
+    for (int i = 0; i < 3; ++i) out[i] = r[i];
+    return true;
+}
+
+// The game's SetBallVelocity node gives the body cur + (param - cur) * k (k: its LerpRate) each time it runs. From what
+// it is about to set (lerped) and its parameter, the body's own velocity before it: what keeps a thrown ball on the path
+// the hand gave it. False when k leaves nothing of it (k near 1: the node sets its parameter outright) or not finite.
+static inline bool vr_ball_unlerp(const float lerped[3], const float param[3], float k, float out[3]) {
+    if (!isfinite(k) || k < 0 || k > 0.98f) return false;
+    float r[3];
+    for (int i = 0; i < 3; ++i) {
+        r[i] = (lerped[i] - k * param[i]) / (1 - k);
+        if (!isfinite(r[i])) return false;
+    }
+    for (int i = 0; i < 3; ++i) out[i] = r[i];
+    return true;
+}
+
+// The mean of n vectors (samples of the hand around its release). False for none.
+static inline bool vr_mean3(const float (*v)[3], int n, float out[3]) {
+    if (n <= 0) return false;
+    float s[3] = {0, 0, 0};
+    for (int k = 0; k < n; ++k) for (int i = 0; i < 3; ++i) s[i] += v[k][i];
+    for (int i = 0; i < 3; ++i) {
+        s[i] /= (float)n;
+        if (!isfinite(s[i])) return false;
+    }
+    for (int i = 0; i < 3; ++i) out[i] = s[i];
+    return true;
+}

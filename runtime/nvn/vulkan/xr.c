@@ -347,6 +347,8 @@ static void locate(XrSpace space, int slot, XrTime t, VrPose *out) {
         float dt = (float)((t - prev_pose[slot].t) * 1e-9);
         for (int i = 0; i < 3; i++) out->vel[i] = (out->pos[i] - prev_pose[slot].pos[i]) / dt;
     }
+    if (v.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)  // (the ball's spin: vr_input.c; none from the runtime, none)
+        out->avel[0] = v.angularVelocity.x, out->avel[1] = v.angularVelocity.y, out->avel[2] = v.angularVelocity.z;
     memcpy(prev_pose[slot].pos, out->pos, sizeof prev_pose[slot].pos);
     prev_pose[slot].t = t, prev_pose[slot].have = true;
     out->valid = true;
@@ -385,6 +387,11 @@ static void locate_joints(int h, XrTime t, VrInput *in) {
             p->vel[0] = velocities[j].linearVelocity.x;
             p->vel[1] = velocities[j].linearVelocity.y;
             p->vel[2] = velocities[j].linearVelocity.z;
+        }
+        if (velocities[j].velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) {
+            p->avel[0] = velocities[j].angularVelocity.x;
+            p->avel[1] = velocities[j].angularVelocity.y;
+            p->avel[2] = velocities[j].angularVelocity.z;
         }
     }
     if (!in->hand[h].valid && in->joint[h][VR_HAND_WRIST].valid) {

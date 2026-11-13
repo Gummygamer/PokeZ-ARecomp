@@ -41,6 +41,23 @@ the window as usual.
   - `LARECOMP_VR_THROW_HAND=left`: throw with the left hand (the triggers swap).
   - `LARECOMP_VR_THROW=tap`: the swing is a short ZR press instead (the trigger alone does nothing); `=0`: no
     gesture, the trigger is plain ZR.
+- **The ball flies the way you threw it (game 2.0.0).** The ball takes your hand's velocity at the release: its
+  direction (left, right, a lob up, a throw at the ground - wherever you look while you throw), its speed (a soft
+  toss falls short, a hard throw goes far) and its spin (a flick of the wrist spins the ball). The velocity is the
+  average of the last few centimetres of the swing, not one tracking sample, so the ball goes where the arm went.
+  Through its flight the game's own steering towards the aim on screen is taken back out frame by frame, so gravity
+  and what it hits decide where it lands; when the game itself acts on the ball (a bounce, a catch), the flight is
+  the game's again.
+  - `LARECOMP_VR_BALL_SCALE=<x>`: the ball's speed for the hand's (default 1: a 10 m/s throw is a 10 m/s ball).
+    Raise it if your throws fall short of where the game's own throws reach.
+  - `LARECOMP_VR_BALL_SPIN=<0-1>`: how much of the hand's spin the ball takes (default 1; `0`: the game's spin).
+  - `LARECOMP_VR_THROW_WINDOW=<ms>`: how much of the swing before its peak the release velocity averages (35).
+  - `LARECOMP_VR_BALL=first`: the hand's velocity at the release only, the game steers the flight; `=0`: the ball
+    flies as the game throws it.
+  - `LARECOMP_VR_BALL_GRAVITY=<m/s²>`: for a ball the game drives outright, the fall of the hand's throw (9.8).
+  - `LARECOMP_LOG_BALL=1`: each of the game's ball-velocity calls in the log (`[ball]`), with or without a headset;
+    each throw (`[vr] throw`) and its ball (`[vr] ball of throw`: the game's velocity and the hand's) are always
+    logged.
 - **Vibration.** The game's rumble on both controllers, and a short pulse on the throw.
 - **Your arms are the character's (game 2.0.0, first person).** The character's arms reach to where your hands are:
   shoulder to elbow to wrist solved each frame on the character's own skeleton, the hand turned as yours is, the
@@ -63,17 +80,24 @@ the window as usual.
   `0` turns it off).
 - **Player body.** The arms follow the hands (above), but the rest of the body is still the game's animation: the
   torso doesn't lean with the head, and walking animations still swing the shoulders under the tracked arms.
-  Head-mesh suppression and reliable torso visibility are not implemented. The neck-to-eye offset follows head
-  ides every call in that second, `=0`
-  none). `LARECOMP_LOG_BALL=1` logs each call's velocities (`[ball]`), with or without a headset. Game versions
-  1.0.0 and 2.0.2 need their own address for the patch.
+  Reliable torso visibility is not implemented. The neck-to-eye offset follows the head's turn
+  (`LARECOMP_VR_EYE_FORWARD`, 0.13 m ahead of the head's middle; `LARECOMP_VR_EYE_HEIGHT`, 1.45 m).
+- **The ball leaves from the character's hand.** It flies the way your hand threw it (above), but it starts where the
+  game puts it: the character's hand, which follows yours with the arm tracking on - not from the controller itself.
+- **Throwing on game versions 1.0.0 and 2.0.2.** The swing still throws (ZR), but the ball flies as the game aims
+  it: the ball patch has only 2.0.0's address.
 - **The F1 menu and the start screen with the VR controllers.** Use the keyboard, mouse or a gamepad for those.
 - **Other controllers' layouts** beyond Touch, Index and the generic OpenXR one, and remapping.
 
 ## For developers
 
 - `runtime/vr.h`: the interface. `runtime/nvn/vulkan/xr.c`: the OpenXR session. `runtime/hle/vr_input.c`: the pad
-  mapping and the throw detection (no OpenXR in it).
+  mapping, the throw detection and the thrown ball (no OpenXR in it).
+- The ball: `tools/za_patches.py` `ZA_BALL` hooks the action node SetBallVelocity (2.0.0 `f_70028c773c`) just
+  before it gives the body its velocities, `cur + (param - cur) * LerpRate`. The hook gets the body, both vectors,
+  the node and its context (the LerpRate and the parameters, to take the lerp out of the flight's later frames).
+  The hand's velocity reaches the world through `vr_world_rotation` (`vr_camera.c`: the same play-space -> world
+  turn the first-person camera was made with).
 - `runtime/hle/vr_camera.c`: the 2.0.0 camera submission diagnostic. Its 0xd0-byte block contains lens settings
   at +0x00, world position at +0x40, view at +0x50 and projection at +0x90. Both matrices are column-major,
   as is the scene's view-projection. Throw directions use matrix rows indexed across the stored columns;

@@ -13,8 +13,10 @@
 // the trigger still held. Letting go of the trigger without a swing lets go of ZR too, as on a controller.
 // =tap: for a game that throws on the press - the trigger does nothing, the swing is a short ZR press.
 // =0: the trigger is ZR and nothing else. LARECOMP_VR_THROW_HAND=left: the other hand (the triggers swap).
-// Each throw is kept (vr_last_throw: where the hand was, its velocity, the head) for a ball that flies the way it was
-// thrown, which needs the game's own throw code and is not done here.
+// Each throw is kept (vr_last_throw: where the hand was, its velocity and spin, the head), and the ball the game throws
+// then flies the way the hand threw it (rt_za_ball_velocity below). The release's velocity is the mean of the hand's
+// samples from LARECOMP_VR_THROW_WINDOW ms (35) before the swing's peak to a frame after it - what the hand did over
+// the last few centimetres of the swing, not one frame's reading of it.
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -82,6 +84,38 @@ static bool head_forward(const VrPose *h, float f[3]) {
     return true;
 }
 
+// The throwing hand's last samples (a ring, at the headset's frames: 16 is 0.13 s at 120 Hz, 0.22 s at 72)
+static struct { double t; float vel[3], avel[3]; } hist[16];
+static unsigned hist_n;
+static void hist_add(const VrInput *in, const VrPose *p) {
+    if (hist_n && in->t <= hist[(hist_n - 1) % 16].t) return;  // (the same XR frame again)
+    hist[hist_n % 16].t = in->t;
+    memcpy(hist[hist_n % 16].vel, p->vel, sizeof p->vel);
+    memcpy(hist[hist_n % 16].avel, p->avel, sizeof p->avel);
+    hist_n++;
+}
+// The throw's velocity and spin: the mean of the samples from window seconds before the peak to the frame after it
+static void release_of(double t_peak, VrThrow *th) {
+    static float window = -1;
+    if (window < 0) {
+        const char *e = ENV("LARECOMP_VR_THROW_WINDOW");
+        window = (e ? (float)atof(e) : 35.0f) * 1e-3f;
+        if (!(window >= 0 && window < 0.2f)) window = 0.035f;
+    }
+    float v[16][3], a[16][3];
+    int n = 0;
+    for (unsigned k = 0; k < 16 && k < hist_n; k++) {
+        unsigned i = (hist_n - 1 - k) % 16;
+        if (hist[i].t < t_peak - window - 1e-4 || hist[i].t > t_peak + 0.017) continue;
+        memcpy(v[n], hist[i].vel, sizeof v[n]), memcpy(a[n], hist[i].avel, sizeof a[n]), n++;
+    }
+    float mv[3], ma[3];
+    if (vr_mean3((const float (*)[3])v, n, mv) && vr_mean3((const float (*)[3])a, n, ma)) {
+        memcpy(th->vel, mv, sizeof mv), memcpy(th->avel, ma, sizeof ma);
+        th->speed = sqrtf(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
+    }
+}
+
 // One frame of the throwing hand. Returns whether ZR is held for the game now.
 static bool throw_step(const VrInput *in) {
     static bool held, thrown;
@@ -93,13 +127,14 @@ static bool throw_step(const VrInput *in) {
     if (mode == THROW_OFF) return trig > 0.5f;
     if (!in->head.valid || !in->hand[h].valid) {
         held = thrown = false;
-        peak = 0;
+        peak = 0, hist_n = 0;
         return mode == THROW_HOLD && trig > 0.5f;
     }
     bool was = held;
     held = held ? trig > 0.3f : trig > 0.6f;  // (hysteresis: a trigger resting half pressed doesn't flutter)
     if (held && !was) t_hold = in->t, peak = 0, thrown = false;
     const VrPose *p = &in->hand[h];
+    hist_add(in, p);
     float v = p->valid ? sqrtf(p->vel[0] * p->vel[0] + p->vel[1] * p->vel[1] + p->vel[2] * p->vel[2]) : 0;
     float f[3];
     // away from the player: the arm coming back for the swing is as fast as the swing itself
@@ -112,6 +147,7 @@ static bool throw_step(const VrInput *in) {
             at_peak = (VrThrow){.t = in->t, .hand = h, .speed = v, .head = in->head};
             memcpy(at_peak.pos, p->pos, sizeof at_peak.pos);
             memcpy(at_peak.vel, p->vel, sizeof at_peak.vel);
+            memcpy(at_peak.avel, p->avel, sizeof at_peak.avel);
         }
         if (peak >= thr && v < 0.8f * peak && in->t - t_hold > 0.12) fire = true;
         else if (peak < thr && v < 0.5f * peak) peak = v;  // (a slower move that ended: the next one starts from here)
@@ -122,11 +158,13 @@ static bool throw_step(const VrInput *in) {
         thrown = true;
         t_tap = in->t;
         at_peak.seq = last_throw.seq + 1;
+        release_of(t_peak, &at_peak);
         last_throw = at_peak;
         throw_ns = plat_now_ns();
         pulse[h].amp = 0.8f, pulse[h].secs = 0.08f, pulse[h].set = true;
-        LOG("[vr] throw %llu: %.1f m/s (%.2f %.2f %.2f) from (%.2f %.2f %.2f)\n", (unsigned long long)at_peak.seq, at_peak.speed,
-            at_peak.vel[0], at_peak.vel[1], at_peak.vel[2], at_peak.pos[0], at_peak.pos[1], at_peak.pos[2]);
+        LOG("[vr] throw %llu: %.1f m/s (%.2f %.2f %.2f) from (%.2f %.2f %.2f), spin (%.1f %.1f %.1f) rad/s, peak %.1f m/s\n",
+            (unsigned long long)at_peak.seq, at_peak.speed, at_peak.vel[0], at_peak.vel[1], at_peak.vel[2], at_peak.pos[0],
+            at_peak.pos[1], at_peak.pos[2], at_peak.avel[0], at_peak.avel[1], at_peak.avel[2], peak);
     }
     if (mode == THROW_TAP) return thrown && in->t - t_tap < 0.15;
     return held && !thrown;
@@ -146,6 +184,7 @@ static void clean_pose(VrPose *p) {
     for (int i = 0; i < 3; i++) {
         if (!isfinite(p->pos[i])) p->valid = false;
         if (!isfinite(p->vel[i])) p->vel[i] = 0;
+        if (!isfinite(p->avel[i])) p->avel[i] = 0;
     }
     for (int i = 0; i < 4; i++) norm += p->rot[i] * p->rot[i];
     if (!isfinite(norm) || norm < 1e-8f) p->valid = false;
@@ -234,16 +273,50 @@ VrThrow vr_last_throw(void) {
 }
 
 // ---- the thrown ball (Pokémon Z-A; the generator's patch: tools/za_patches.py ZA_BALL)
-// The game is about to give a ball's body its velocities (the action node SetBallVelocity): lin and ang are guest
-// addresses of a vec4 each, the world's x y z (metres a second: to be confirmed in play, LARECOMP_VR_BALL_SCALE
-// multiplies the hand's). Within a second of a throw found in the hand's motion, the first of these calls gets the
-// hand's velocity instead of the game's: the play space's axes laid on the scene camera's - ahead of the player is
-// where the camera looks along the ground, right is its right, up is up (the camera from the last frame drawn,
-// vulkan/exec.c vk_scene_view_proj). Later calls of the same throw are the game's own (a node that runs every frame
-// steers the ball back by its LerpRate). LARECOMP_VR_BALL=0: never; =all: every call in that second.
-// LARECOMP_LOG_BALL=1: each call's velocities in the log, VR or not (which throws go through this node, and how fast).
+// The game is about to give a ball's body its velocities (the action node SetBallVelocity, f_70028c773c in 2.0.0): lin
+// and ang are guest addresses of a vec4 each, the world's x y z (metres a second, radians a second), node and ctx the
+// node and its context (the parameters: LinearVelocity, AngularVelocity, LerpRate, XZOnly - what the node moves the
+// body's velocities towards, and how far: lin = cur + (param - cur) * LerpRate).
+// The release: within a second of a throw found in the hand's motion, the first of these calls gets the hand's
+// velocity instead of the game's - turned into the world the way the first-person camera was (vr_world_rotation: the
+// recentring's yaw and the game camera's, so the head's turn plays no part, and the throw's pitch stays: a lob goes
+// up, a throw at the ground goes down), times LARECOMP_VR_BALL_SCALE (1) and the world's scale; and the hand's spin
+// for its angular velocity (LARECOMP_VR_BALL_SPIN: 1 the hand's, 0 the game's, between: that much of the hand's; at
+// most 40 rad/s). Without a first-person camera (theater) the play space is laid on the scene camera's axes along the
+// ground (vr_world_velocity) and the spin is the game's.
+// The flight: the node runs again for the same body at every frame after (each call within 150 ms of the last) and
+// would steer the ball back to the game's own aim by its LerpRate: its lerp is taken back out (vr_ball_unlerp), so the
+// body keeps what its own physics made of the hand's throw - gravity, a hit. A node that sets its parameter outright
+// (LerpRate near 1) leaves nothing to take out: the ball then flies the hand's velocity under
+// LARECOMP_VR_BALL_GRAVITY (9.8 m/s^2). The flight ends 4 s after the release, at a call after a pause (the game's own
+// event: a bounce, a catch - its velocity goes as the game set it) or at the next throw.
+// LARECOMP_VR_BALL=0: never; =first: the release only (the game steers the flight). LARECOMP_LOG_BALL=1: each call's
+// velocities in the log, VR or not (which throws go through this node, and how fast).
 // Called on a game thread, any of them.
-void rt_za_ball_velocity(uint64_t body, uint64_t lin, uint64_t ang) {
+static struct { uint64_t body, seq, ns0, ns_last; float v0[3]; } flight;
+static uint64_t ball_used;  // (the throw whose ball already has the hand's velocity)
+
+static float env_f(const char *name, float def) {
+    const char *e = ENV(name);
+    float v = e ? (float)atof(e) : def;
+    return isfinite(v) ? v : def;
+}
+
+// The node's parameters (f_70028c773c: the context's block at *ctx, the node's offsets into it at +0x48 LerpRate,
+// +0x54 LinearVelocity, +0x58 AngularVelocity)
+static bool ball_params(uint64_t node, uint64_t ctx, float *k, const float **plin, const float **pang) {
+    if (node < 0x7000000000ull || ctx < 0x7000000000ull) return false;
+    uint64_t base = *(const uint64_t *)(uintptr_t)ctx;
+    if (base < 0x7000000000ull) return false;
+    const uint32_t *o = (const uint32_t *)(uintptr_t)(node + 0x48);
+    uint32_t ok = o[0], ol = o[3], oa = o[4];  // (+0x48, +0x54, +0x58)
+    if (ok > 0x100000 || ol > 0x100000 || oa > 0x100000) return false;
+    *k = *(const float *)(uintptr_t)(base + ok);
+    *plin = (const float *)(uintptr_t)(base + ol), *pang = (const float *)(uintptr_t)(base + oa);
+    return isfinite(*k);
+}
+
+void rt_za_ball_velocity(uint64_t body, uint64_t lin, uint64_t ang, uint64_t node, uint64_t ctx) {
     float *l = (float *)(uintptr_t)lin, *a = (float *)(uintptr_t)ang;
     if (ENV("LARECOMP_LOG_BALL")) {
         static _Atomic int n;
@@ -253,33 +326,71 @@ void rt_za_ball_velocity(uint64_t body, uint64_t lin, uint64_t ang) {
     }
     const char *mode = ENV("LARECOMP_VR_BALL");
     if (mode && !strcmp(mode, "0")) return;
-    static uint64_t used;  // (the throw whose ball already has the hand's velocity)
+    bool keep = !(mode && !strcmp(mode, "first"));
+    uint64_t now = plat_now_ns();
     pthread_mutex_lock(&lock);
     VrThrow t = last_throw;
-    bool live = updated_ns && plat_now_ns() - updated_ns < 500000000ull;
-    bool take = live && t.seq && plat_now_ns() - throw_ns < 1000000000ull && (t.seq != used || (mode && !strcmp(mode, "all")));
+    bool live = updated_ns && now - updated_ns < 500000000ull;
+    bool fresh = live && t.seq && now - throw_ns < 1000000000ull && t.seq != ball_used;
+    bool flying = !fresh && keep && flight.body == body && flight.seq == t.seq && now - flight.ns_last < 150000000ull &&
+                  now - flight.ns0 < 4000000000ull;
+    if (!fresh && !flying && flight.body == body) flight.body = 0;  // (the game's own call: the flight is its again)
+    if (flying) flight.ns_last = now;
+    float v0[3];
+    memcpy(v0, flight.v0, sizeof v0);
+    uint64_t ns0 = flight.ns0;
     pthread_mutex_unlock(&lock);
-    if (!take) return;
-    float vp[16];
+
+    if (flying) {
+        float k, cur[3];
+        const float *plin, *pang;
+        if (!ball_params(node, ctx, &k, &plin, &pang)) return;
+        if (vr_ball_unlerp(l, plin, k, cur)) memcpy(l, cur, sizeof cur);
+        else {  // (the node sets its velocity outright: the hand's under gravity)
+            float g = env_f("LARECOMP_VR_BALL_GRAVITY", 9.8f), s = (float)((now - ns0) * 1e-9);
+            l[0] = v0[0], l[1] = v0[1] - g * s, l[2] = v0[2];
+        }
+        if (vr_ball_unlerp(a, pang, k, cur)) memcpy(a, cur, sizeof cur);
+        return;
+    }
+    if (!fresh) return;
+
+    float w[3], wa[3] = {a[0], a[1], a[2]}, rot[3][3], ws;
+    float k = env_f("LARECOMP_VR_BALL_SCALE", 1.0f);
+    if (!(k > 0)) return;
+    bool fp = vr_world_rotation(rot, &ws);
+    if (fp) {
+        if (!vr_rot_apply(rot, t.vel, k * ws, w)) return;
+        float spin = env_f("LARECOMP_VR_BALL_SPIN", 1.0f), h[3];
+        if (spin > 0 && vr_rot_apply(rot, t.avel, 1, h)) {
+            float n = sqrtf(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]), cap = n > 40 ? 40 / n : 1;
+            for (int i = 0; i < 3; i++) wa[i] = a[i] + (h[i] * cap - a[i]) * (spin > 1 ? 1 : spin);
+        }
+    } else {
+        float vp[16];
 #ifndef __APPLE__
-    extern bool vk_scene_view_proj(float out[16]);
-    if (!vk_scene_view_proj(vp)) return;
+        extern bool vk_scene_view_proj(float out[16]);
+        if (!vk_scene_view_proj(vp)) return;
 #else
-    return;  // (no VR on the Metal backend)
+        return;  // (no VR on the Metal backend)
 #endif
-    const char *se = ENV("LARECOMP_VR_BALL_SCALE");
-    float k = se ? (float)atof(se) : 1.0f;
-    float w[3];
-    if (!vr_world_velocity(vp, t.vel, k, w)) return;
+        if (!vr_world_velocity(vp, t.vel, k, w)) return;
+    }
     // Claim only after conversion succeeds; two game threads cannot consume the same throw.
     pthread_mutex_lock(&lock);
-    bool all = mode && !strcmp(mode, "all");
-    if (used == t.seq && !all) { pthread_mutex_unlock(&lock); return; }
-    used = t.seq;
+    if (ball_used == t.seq) { pthread_mutex_unlock(&lock); return; }
+    ball_used = t.seq;
+    if (keep) {
+        flight.body = body, flight.seq = t.seq, flight.ns0 = flight.ns_last = now;
+        memcpy(flight.v0, w, sizeof w);
+    }
     pthread_mutex_unlock(&lock);
-    LOG("[vr] ball of throw %llu: the game's velocity (%.2f %.2f %.2f) -> the hand's (%.2f %.2f %.2f)\n", (unsigned long long)t.seq,
-        l[0], l[1], l[2], w[0], w[1], w[2]);
+    LOG("[vr] ball of throw %llu (%s): the game's velocity (%.2f %.2f %.2f) %.1f m/s -> the hand's (%.2f %.2f %.2f) %.1f m/s, "
+        "spin (%.1f %.1f %.1f) -> (%.1f %.1f %.1f)\n", (unsigned long long)t.seq, fp ? "first person" : "theater", l[0], l[1], l[2],
+        sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]), w[0], w[1], w[2], sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]), a[0], a[1],
+        a[2], wa[0], wa[1], wa[2]);
     l[0] = w[0], l[1] = w[1], l[2] = w[2];
+    a[0] = wa[0], a[1] = wa[1], a[2] = wa[2];
 }
 
 // ---- vibration
